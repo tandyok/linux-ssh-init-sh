@@ -27,23 +27,44 @@ set -eu
 # ---------------- Language Config ----------------
 LANG_CUR="en" # Default
 
-# Check args for language override
+# ---------------- Automation Variables ----------------
+ARG_USER=""
+ARG_PORT=""     # "22", "random", or specific number
+ARG_KEY_TYPE="" # "gh", "url", "raw"
+ARG_KEY_VAL=""
+ARG_UPDATE=""   # "y" or "n"
+ARG_BBR=""      # "y" or "n"
+AUTO_CONFIRM="n"
+STRICT_MODE="n"
+
+# Parse Arguments
 for a in "$@"; do
   case "$a" in
-    --lang=zh) LANG_CUR="zh" ;;
-    --lang=en) LANG_CUR="en" ;;
+    --lang=zh)     LANG_CUR="zh" ;;
+    --lang=en)     LANG_CUR="en" ;;
+    --strict)      STRICT_MODE="y" ;;
+    --yes)         AUTO_CONFIRM="y" ;;
+    
+    --user=*)      ARG_USER="${a#*=}" ;;
+    
+    --port=random) ARG_PORT="random" ;;
+    --port=*)      ARG_PORT="${a#*=}" ;;
+    
+    --key-gh=*)    ARG_KEY_TYPE="gh";  ARG_KEY_VAL="${a#*=}" ;;
+    --key-url=*)   ARG_KEY_TYPE="url"; ARG_KEY_VAL="${a#*=}" ;;
+    --key-raw=*)   ARG_KEY_TYPE="raw"; ARG_KEY_VAL="${a#*=}" ;;
+    
+    --update)      ARG_UPDATE="y" ;;
+    --no-update)   ARG_UPDATE="n" ;;
+    
+    --bbr)         ARG_BBR="y" ;;
+    --no-bbr)      ARG_BBR="n" ;;
   esac
 done
 
-# Simple language selector if not provided
+# Simple language selector if not provided via arg
 if [ -z "${LANG_CUR}" ]; then
-  # Auto-detect is hard in POSIX sh reliably, so we default to EN or prompt
-  # We just set default to EN above. 
-  # If you want interactive prompt at start, uncomment below:
-  # echo "Select Language: 1) English (Default)  2) 简体中文"
-  # read l_opt
-  # [ "$l_opt" = "2" ] && LANG_CUR="zh"
-  true
+  true # Default is EN, logic kept simple for automation
 fi
 
 # ---------------- Messages ----------------
@@ -52,7 +73,7 @@ msg() {
   if [ "$LANG_CUR" = "zh" ]; then
     case "$key" in
       MUST_ROOT)   echo "必须以 root 权限运行此脚本" ;;
-      BANNER)      echo "服务器初始化 & SSH 安全加固 (v2.3 i18n)" ;;
+      BANNER)      echo "服务器初始化 & SSH 安全加固 (v2.4 Auto)" ;;
       STRICT_ON)   echo "STRICT 模式已开启：任何关键错误将直接退出" ;;
       ASK_USER)    echo "SSH 登录用户 (root 或普通用户，默认 " ;;
       ASK_PORT_T)  echo "SSH 端口配置：" ;;
@@ -94,12 +115,13 @@ msg() {
       DONE_MSG1)   echo "请【不要关闭】当前窗口。" ;;
       DONE_MSG2)   echo "请新开一个终端窗口测试登录：" ;;
       DONE_FW)     echo "⚠ 若无法连接，请再次检查防火墙设置" ;;
+      AUTO_SKIP)   echo "检测到参数输入，跳过询问: " ;;
       *)           echo "$key" ;;
     esac
   else
     case "$key" in
       MUST_ROOT)   echo "Must be run as root" ;;
-      BANNER)      echo "Server Init & SSH Hardening (v2.3 i18n)" ;;
+      BANNER)      echo "Server Init & SSH Hardening (v2.4 Auto)" ;;
       STRICT_ON)   echo "STRICT mode ON: Critical errors will abort" ;;
       ASK_USER)    echo "SSH Login User (root or normal user, default " ;;
       ASK_PORT_T)  echo "SSH Port Configuration:" ;;
@@ -141,19 +163,19 @@ msg() {
       DONE_MSG1)   echo "Please DO NOT close this window yet." ;;
       DONE_MSG2)   echo "Open a NEW terminal to test login:" ;;
       DONE_FW)     echo "⚠ If connection fails, check your Firewall settings." ;;
+      AUTO_SKIP)   echo "Argument detected, skipping prompt: " ;;
       *)           echo "$key" ;;
     esac
   fi
 }
 
 # =========================================================
-# Core Logic (Identical to v2.2)
+# Core Logic
 # =========================================================
 
 LOG_FILE="/var/log/server-init.log"
 SSH_CONF="/etc/ssh/sshd_config"
 DEFAULT_USER="deploy"
-STRICT_MODE="n"
 
 BLOCK_BEGIN="# BEGIN SERVER-INIT MANAGED BLOCK"
 BLOCK_END="# END SERVER-INIT MANAGED BLOCK"
@@ -171,10 +193,6 @@ die() { err "$*"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "$(msg MUST_ROOT)"
 touch "$LOG_FILE" 2>/dev/null || true
-
-for a in "$@"; do
-  [ "$a" = "--strict" ] && STRICT_MODE="y"
-done
 
 # ---------------- package manager ----------------
 detect_pm() {
@@ -260,14 +278,12 @@ update_system() {
 enable_bbr() {
   command -v sysctl >/dev/null 2>&1 || return
   
-  # Check if BBR available in kernel
   if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
     warn "Kernel does not support BBR, skipping."
     return
   fi
 
   sysctl_conf="/etc/sysctl.conf"
-  # Idempotent write
   grep -q '^net.core.default_qdisc=fq$' "$sysctl_conf" 2>/dev/null || \
     echo 'net.core.default_qdisc=fq' >>"$sysctl_conf"
   grep -q '^net.ipv4.tcp_congestion_control=bbr$' "$sysctl_conf" 2>/dev/null || \
@@ -467,7 +483,7 @@ deploy_keys() {
 }
 
 # =========================================================
-# Phase 1: Input (I18N)
+# Phase 1: Input (Supports Automation)
 # =========================================================
 clear
 echo "================================================="
@@ -475,99 +491,139 @@ msg BANNER
 echo "================================================="
 [ "$STRICT_MODE" = "y" ] && msg STRICT_ON
 
-printf "%s%s): " "$(msg ASK_USER)" "$DEFAULT_USER"
-read TARGET_USER
-[ -z "$TARGET_USER" ] && TARGET_USER="$DEFAULT_USER"
-
-echo ""
-msg ASK_PORT_T
-msg OPT_PORT_1
-msg OPT_PORT_2
-msg OPT_PORT_3
-printf "%s" "$(msg SELECT)"
-read PORT_OPT
-[ -z "$PORT_OPT" ] && PORT_OPT="1"
-
-SSH_PORT="22"
-if [ "$PORT_OPT" = "3" ]; then
-  while :; do
-    printf "%s" "$(msg INPUT_PORT)"
-    read MANUAL_PORT
-    echo "$MANUAL_PORT" | grep -Eq '^[0-9]+$' || { msg PORT_ERR; continue; }
-    [ "$MANUAL_PORT" -ge 1024 ] 2>/dev/null && [ "$MANUAL_PORT" -le 65535 ] 2>/dev/null || { msg PORT_ERR; continue; }
-    SSH_PORT="$MANUAL_PORT"
-    break
-  done
+# 1. User
+if [ -n "$ARG_USER" ]; then
+  TARGET_USER="$ARG_USER"
+  printf "%s%s\n" "$(msg AUTO_SKIP)" "$TARGET_USER"
+else
+  printf "%s%s): " "$(msg ASK_USER)" "$DEFAULT_USER"
+  read TARGET_USER
+  [ -z "$TARGET_USER" ] && TARGET_USER="$DEFAULT_USER"
 fi
 
-echo ""
-msg ASK_KEY_T
-msg OPT_KEY_1
-msg OPT_KEY_2
-msg OPT_KEY_3
-printf "%s" "$(msg SELECT)"
-read KEY_OPT
+# 2. Port
+if [ -n "$ARG_PORT" ]; then
+  case "$ARG_PORT" in
+    22)     PORT_OPT="1"; SSH_PORT="22" ;;
+    random) PORT_OPT="2"; SSH_PORT="22" ;; # 22 is placeholder
+    *)      PORT_OPT="3"; SSH_PORT="$ARG_PORT" ;;
+  esac
+  printf "%s%s\n" "$(msg AUTO_SKIP)" "$ARG_PORT (Mode $PORT_OPT)"
+else
+  echo ""
+  msg ASK_PORT_T
+  msg OPT_PORT_1
+  msg OPT_PORT_2
+  msg OPT_PORT_3
+  printf "%s" "$(msg SELECT)"
+  read PORT_OPT
+  [ -z "$PORT_OPT" ] && PORT_OPT="1"
 
-case "$KEY_OPT" in
-  1) KEY_TYPE="gh";  printf "%s" "$(msg INPUT_GH)"; read KEY_VAL ;;
-  2) KEY_TYPE="url"; printf "%s" "$(msg INPUT_URL)"; read KEY_VAL ;;
-  3)
-     KEY_TYPE="raw"
-     msg INPUT_RAW
-     raw=""
-     while IFS= read -r l; do
-       [ -z "$l" ] && break
-       raw="${raw}${l}\n"
-     done
-     KEY_VAL="$(printf "%b" "$raw")"
-     ;;
-  *) die "Invalid Option" ;;
-esac
+  SSH_PORT="22"
+  if [ "$PORT_OPT" = "3" ]; then
+    while :; do
+      printf "%s" "$(msg INPUT_PORT)"
+      read MANUAL_PORT
+      echo "$MANUAL_PORT" | grep -Eq '^[0-9]+$' || { msg PORT_ERR; continue; }
+      [ "$MANUAL_PORT" -ge 1024 ] 2>/dev/null && [ "$MANUAL_PORT" -le 65535 ] 2>/dev/null || { msg PORT_ERR; continue; }
+      SSH_PORT="$MANUAL_PORT"
+      break
+    done
+  fi
+fi
 
-printf "%s" "$(msg ASK_UPD)"
-read DO_UPDATE
-[ -z "$DO_UPDATE" ] && DO_UPDATE="n"
+# 3. Key
+if [ -n "$ARG_KEY_TYPE" ]; then
+  KEY_OPT="auto"
+  KEY_TYPE="$ARG_KEY_TYPE"
+  KEY_VAL="$ARG_KEY_VAL"
+  printf "%s%s\n" "$(msg AUTO_SKIP)" "$KEY_TYPE ($KEY_VAL)"
+else
+  echo ""
+  msg ASK_KEY_T
+  msg OPT_KEY_1
+  msg OPT_KEY_2
+  msg OPT_KEY_3
+  printf "%s" "$(msg SELECT)"
+  read KEY_OPT
 
-printf "%s" "$(msg ASK_BBR)"
-read DO_BBR
-[ -z "$DO_BBR" ] && DO_BBR="n"
+  case "$KEY_OPT" in
+    1) KEY_TYPE="gh";  printf "%s" "$(msg INPUT_GH)"; read KEY_VAL ;;
+    2) KEY_TYPE="url"; printf "%s" "$(msg INPUT_URL)"; read KEY_VAL ;;
+    3)
+       KEY_TYPE="raw"
+       msg INPUT_RAW
+       raw=""
+       while IFS= read -r l; do
+         [ -z "$l" ] && break
+         raw="${raw}${l}\n"
+       done
+       KEY_VAL="$(printf "%b" "$raw")"
+       ;;
+    *) die "Invalid Option" ;;
+  esac
+fi
+
+# 4. Update
+if [ -n "$ARG_UPDATE" ]; then
+  DO_UPDATE="$ARG_UPDATE"
+  printf "%s%s\n" "$(msg AUTO_SKIP)" "Update=$DO_UPDATE"
+else
+  printf "%s" "$(msg ASK_UPD)"
+  read DO_UPDATE
+  [ -z "$DO_UPDATE" ] && DO_UPDATE="n"
+fi
+
+# 5. BBR
+if [ -n "$ARG_BBR" ]; then
+  DO_BBR="$ARG_BBR"
+  printf "%s%s\n" "$(msg AUTO_SKIP)" "BBR=$DO_BBR"
+else
+  printf "%s" "$(msg ASK_BBR)"
+  read DO_BBR
+  [ -z "$DO_BBR" ] && DO_BBR="n"
+fi
 
 # =========================================================
-# Phase 2: Confirm (I18N)
+# Phase 2: Confirm
 # =========================================================
-echo ""
-msg CONFIRM_T
-echo "$(msg C_USER)$TARGET_USER"
-echo "$(msg C_PORT)$SSH_PORT ($PORT_OPT)"
-echo "$(msg C_KEY)$KEY_TYPE"
-echo "$(msg C_UPD)$DO_UPDATE"
-echo "$(msg C_BBR)$DO_BBR"
-[ "$PORT_OPT" != "1" ] && msg WARN_FW
+if [ "$AUTO_CONFIRM" = "y" ]; then
+  echo ""
+  echo "[Auto-Confirm] Skipping interactive confirmation."
+else
+  echo ""
+  msg CONFIRM_T
+  echo "$(msg C_USER)$TARGET_USER"
+  echo "$(msg C_PORT)$SSH_PORT (Mode: $PORT_OPT)"
+  echo "$(msg C_KEY)$KEY_TYPE"
+  echo "$(msg C_UPD)$DO_UPDATE"
+  echo "$(msg C_BBR)$DO_BBR"
+  [ "$PORT_OPT" != "1" ] && msg WARN_FW
 
-printf "%s" "$(msg ASK_SURE)"
-read CONFIRM
-[ "${CONFIRM:-n}" = "y" ] || die "$(msg CANCEL)"
+  printf "%s" "$(msg ASK_SURE)"
+  read CONFIRM
+  [ "${CONFIRM:-n}" = "y" ] || die "$(msg CANCEL)"
+fi
 
 # =========================================================
-# Phase 3: Execute (Logic from v2.2)
+# Phase 3: Execute
 # =========================================================
 info "$(msg I_INSTALL)"
 ensure_ssh_server
 install_pkg_try curl >/dev/null 2>&1 || die "curl install failed"
 
-# Optional updates
+# Updates & BBR
 if [ "$DO_UPDATE" = "y" ]; then
   info "$(msg I_UPD)"
   update_system
 fi
 
-# Optional BBR
 if [ "$DO_BBR" = "y" ]; then
   info "$(msg I_BBR)"
   enable_bbr
 fi
 
-# Random Port (handled here to ensure tools exist)
+# Random Port (Handled here to use installed tools)
 if [ "$PORT_OPT" = "2" ]; then
   p="$(pick_random_port || true)"
   if [ -n "$p" ]; then

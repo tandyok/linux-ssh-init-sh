@@ -3,24 +3,30 @@
 # linux-ssh-init-sh
 # Server Init & SSH Hardening Script
 #
-# Release: v4.0.0 (Platinum Edition)
+# Release: v4.5.1 (Fortress Pro - POSIX Final)
 #
-# POSIX sh compatible (works on Debian/CentOS/Alpine/Ubuntu)
+# POSIX sh compatible (Debian dash / CentOS / Alpine / Ubuntu)
 #
-# Change Log v4.0.0:
-#   - FEAT: Added 'preflight_checks' for core commands/disk/mem
-#   - FEAT: Robust Triple-Check IPv6 detection (Proc/IP/Ifconfig)
-#   - FEAT: Backup metadata generation (.meta files)
-#   - FEAT: Final Health Report generation
-#   - FIX: Random port math comment clarification
-#   - FIX: Replaced bash-isms (arrays) with POSIX string handling
+# Key policy:
+#   - If `base64` exists: strict base64 decode + key length checks
+#   - If `base64` missing: downgrade to format-only validation (skip length checks)
+#
+# Changelog v4.5.1:
+#   - Fix: awk match() 3-arg replaced with sed (mawk/BusyBox compat)
+#   - Fix: install_managed_block uses head/tail instead of awk catfile
+#   - Fix: IFS restoration handled correctly (unset case)
+#   - Fix: sshd -T -C only used on OpenSSH >= 6.8
+#   - Fix: Removed 22 from hard-reserved ports list
+#   - Fix: Reduced duplicate warnings in key validation
+#   - Fix: Numeric comparisons with empty value guards
+#   - Fix: TMP_DIR fallback includes random component
 # =========================================================
 
 set -u
 SCRIPT_START_TIME=$(date +%s)
 
 # ---------------- Configuration ----------------
-LANG_CUR="zh" # Default Language
+LANG_CUR="zh"
 LOG_FILE="/var/log/server-init.log"
 AUDIT_FILE="/var/log/server-init-audit.log"
 BACKUP_REPO="/var/backups/ssh-config"
@@ -30,9 +36,44 @@ DEFAULT_USER="deploy"
 BLOCK_BEGIN="# BEGIN SERVER-INIT MANAGED BLOCK"
 BLOCK_END="# END SERVER-INIT MANAGED BLOCK"
 
-# Create Secure Temp Directory
-TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'ssh-init-XXXXXX')
-chmod 700 "$TMP_DIR"
+# ---------------- [SEC] Atomic Secure Temp Directory ----------------
+old_umask=$(umask)
+umask 077
+TMP_DIR=""
+if command -v mktemp >/dev/null 2>&1; then
+  TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t ssh-init-XXXXXX 2>/dev/null || echo "")
+fi
+if [ -z "$TMP_DIR" ]; then
+  # [FIX] Fallback with random component for security
+  rand_suffix=""
+  if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+    rand_suffix=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  fi
+  [ -z "$rand_suffix" ] && rand_suffix="$$"
+  TMP_DIR="/tmp/ssh-init.${$}.${rand_suffix}.$(date +%s 2>/dev/null || echo 0)"
+  mkdir -p "$TMP_DIR" 2>/dev/null || { echo "FATAL: Cannot create temp directory: $TMP_DIR" >&2; exit 1; }
+fi
+chmod 700 "$TMP_DIR" 2>/dev/null || true
+umask "$old_umask"
+
+# ---------------- State & Lock Management ----------------
+RUNTIME_DIR="/run/server-init"
+if ! mkdir -p "$RUNTIME_DIR" 2>/dev/null; then
+  RUNTIME_DIR="/var/lib/server-init"
+  if ! mkdir -p "$RUNTIME_DIR" 2>/dev/null; then
+    RUNTIME_DIR="/tmp/server-init"
+    mkdir -p "$RUNTIME_DIR" 2>/dev/null || RUNTIME_DIR="/tmp"
+  fi
+fi
+chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+
+STATE_FILE="$RUNTIME_DIR/state-$(id -u)"
+LOCK_DIR="$RUNTIME_DIR/locks-$(id -u)"
+
+[ -L "$STATE_FILE" ] && rm -f "$STATE_FILE" 2>/dev/null || true
+if [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; then
+  rm -f "$LOCK_DIR" 2>/dev/null || true
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -40,15 +81,34 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
+
+# ---------------- Initialize Variables ----------------
+TARGET_USER=""
+SSH_PORT="22"
+KEY_OK="n"
+PORT_OPT="1"
+KEY_TYPE=""
+KEY_VAL=""
+DO_UPDATE="n"
+DO_BBR="n"
+OPENSSH_VER_MAJOR=0
+OPENSSH_VER_MINOR=0
+
+KEX_LINE=""
+CIPHERS_LINE=""
+MACS_LINE=""
+CRYPTO_MODE="skip"
+IPV6_ENABLED="n"
+ROOT_KEY_PRESENT="n"
 
 # ---------------- Automation Variables ----------------
 ARG_USER=""
-ARG_PORT=""      
-ARG_KEY_TYPE="" 
+ARG_PORT=""
+ARG_KEY_TYPE=""
 ARG_KEY_VAL=""
-ARG_UPDATE=""   
-ARG_BBR=""      
+ARG_UPDATE=""
+ARG_BBR=""
 AUTO_CONFIRM="n"
 STRICT_MODE="n"
 ARG_DELAY_RESTART="n"
@@ -74,42 +134,13 @@ for a in "$@"; do
   esac
 done
 
-# ---------------- Logging & Audit ----------------
-touch "$LOG_FILE" "$AUDIT_FILE" 2>/dev/null || true
-chmod 600 "$LOG_FILE" "$AUDIT_FILE" 2>/dev/null || true
-
-log() { echo "$(date '+%F %T') $*" >>"$LOG_FILE"; }
-
-audit_log() {
-  action="$1"
-  details="$2"
-  {
-    echo "=== $(date '+%F %T') ==="
-    echo "ACTION: $action"
-    echo "USER: $(whoami 2>/dev/null || echo root)"
-    echo "DETAILS: $details"
-    echo "---"
-  } >> "$AUDIT_FILE" 2>/dev/null || true
-  log "[AUDIT] $action - $details"
-}
-
-info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; log "[INFO] $*"; }
-warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; log "[WARN] $*"; }
-err()  { printf "${RED}[ERR ]${NC} %s\n" "$*"; log "[ERR ] $*"; }
-ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; log "[OK] $*"; }
-
-die() {
-  err "$*"
-  exit 1
-}
-
 # ---------------- Internationalization ----------------
 msg() {
   key="$1"
   if [ "$LANG_CUR" = "zh" ]; then
     case "$key" in
       MUST_ROOT)    echo "必须以 root 权限运行此脚本" ;;
-      BANNER)       echo "服务器初始化 & SSH 安全加固 (v4.0.0 Platinum)" ;;
+      BANNER)       echo "服务器初始化 & SSH 安全加固 (v4.5.1 Fortress Pro)" ;;
       STRICT_ON)    echo "STRICT 模式已开启：任何关键错误将直接退出" ;;
       ASK_USER)     echo "SSH 登录用户 (root 或普通用户，默认 " ;;
       ERR_USER_INV) echo "❌ 用户名无效 (仅限小写字母/数字/下划线，且避开系统保留名)" ;;
@@ -146,7 +177,7 @@ msg() {
       I_USER)       echo "正在配置用户..." ;;
       I_SSH_INSTALL) echo "未检测到 OpenSSH，正在安装..." ;;
       I_KEY_OK)     echo "公钥部署成功" ;;
-      W_KEY_FAIL)   echo "公钥部署失败，将保留密码登录以防失联" ;;
+      W_KEY_FAIL)   echo "公钥部署失败，将启用安全回退策略以避免失联" ;;
       I_BACKUP)     echo "已全量备份配置 (SSH/User/Firewall): " ;;
       E_SSHD_CHK)   echo "sshd 配置校验失败，正在回滚..." ;;
       E_GREP_FAIL)  echo "配置验证失败：关键参数未生效，正在回滚..." ;;
@@ -171,26 +202,72 @@ msg() {
       IPV6_CFG)     echo "检测到全局 IPv6 环境，已添加 :: 监听支持" ;;
       SYS_PROT)     echo "正在添加 systemd 服务防误杀保护..." ;;
       MOTD_UPD)     echo "正在更新登录提示信息 (MotD)..." ;;
-      COMPAT_WARN)  echo "检测到旧版 OpenSSH，自动调整配置兼容性..." ;;
+      COMPAT_WARN)  echo "检测到兼容性限制，已自动调整配置..." ;;
       AUDIT_START)  echo "开始执行审计记录..." ;;
       BOX_TITLE)    echo "初始化完成 - 安全配置已生效" ;;
       BOX_SSH)      echo "SSH 连接信息:" ;;
       BOX_KEY_ON)   echo "🔐 密钥认证: 已启用 (密码登录已禁用)" ;;
-      BOX_KEY_OFF)  echo "⚠️ 密钥认证: 未启用 (密码登录保持可用)" ;;
+      BOX_KEY_OFF)  echo "⚠️ 密钥认证: 未启用 (密码登录保持可用/回退策略已启用)" ;;
       BOX_PORT)     echo "📍 端口变更: 22 → " ;;
       BOX_FW)       echo "⚠️  请确认防火墙已开放 TCP 端口" ;;
       BOX_WARN)     echo "重要: 请在新窗口中测试连接，确认成功后再关闭此窗口！" ;;
       BOX_K8S_WARN) echo "⚠️  注意: 使用了 Kubernetes NodePort 范围端口" ;;
       ERR_MISSING)  echo "❌ 缺少必要命令，无法继续: " ;;
+      ERR_MISSING_SSHD) echo "❌ 未找到 sshd 命令，请先安装 OpenSSH Server" ;;
       WARN_DISK)    echo "⚠️  磁盘空间不足: " ;;
       WARN_MEM)     echo "⚠️  可用内存不足: " ;;
-      *)            echo "$key" ;;
+      WARN_RESUME)  echo "检测到未完成的初始化，可能上次执行异常终止" ;;
+      ASK_RESUME)   echo "检测到未完成的操作，是否继续? [y/N]: " ;;
+      ERR_BACKUP_DIR) echo "❌ 无法创建备份目录:" ;;
+      ERR_BACKUP_DIR_ALT) echo "❌ 无法创建备用备份目录" ;;
+      ERR_BACKUP_SUBDIR) echo "❌ 无法创建备份子目录:" ;;
+      INFO_BACKUP_CREATED) echo "✅ 备份已创建:" ;;
+      INFO_CLEANING_BACKUPS) echo "🧹 正在清理" ;;
+      INFO_OLD_BACKUPS) echo "个旧备份..." ;;
+      ERR_LOCK_DIR) echo "❌ 无法创建锁目录:" ;;
+      WARN_LOCK_DIR_PERM) echo "⚠️ 无法设置锁目录权限，继续尝试..." ;;
+      WARN_CLEAN_LOCKS) echo "⚠️ 清理旧的锁文件..." ;;
+      WARN_INVALID_KEY) echo "⚠️ 跳过无效的SSH密钥行" ;;
+      WARN_SHORT_RSA_KEY) echo "⚠️ RSA密钥过短:" ;;
+      WARN_SHORT_ED25519_KEY) echo "⚠️ Ed25519密钥过短:" ;;
+      WARN_SHORT_DSA_KEY) echo "⚠️ DSA密钥过短:" ;;
+      ERR_INVALID_KEY_FORMAT) echo "❌ SSH密钥格式无效" ;;
+      ERR_MISSING_BASE64) echo "❌ SSH密钥缺少base64部分" ;;
+      ERR_INVALID_BASE64) echo "❌ SSH密钥base64编码无效" ;;
+      WARN_NO_BASE64_SKIPLEN) echo "⚠️ 未检测到 base64 命令：将跳过密钥长度校验，仅做格式校验" ;;
+      WARN_USER_SHELL) echo "⚠️ 用户shell不允许登录:" ;;
+      ASK_CHANGE_SHELL) echo "是否更改用户的shell为/bin/bash? [y/N]: " ;;
+      WARN_CHANGE_SHELL_FAIL) echo "⚠️ 更改shell失败" ;;
+      WARN_UNUSUAL_SHELL) echo "⚠️ 用户使用非常规shell:" ;;
+      WARN_HOME_OWNER) echo "⚠️ 用户家目录所有者异常:" ;;
+      WARN_HOME_NOT_WRITABLE) echo "⚠️ 用户家目录不可写" ;;
+      ERR_USER_CREATE_FAIL) echo "❌ 创建用户失败" ;;
+      ERR_USER_VERIFY_FAIL) echo "❌ 用户创建后验证失败" ;;
+      WARN_NO_SUDOERS_DIR) echo "⚠️ 没有/etc/sudoers.d目录，跳过sudo配置" ;;
+      INFO_SUDO_EXISTS) echo "ℹ️ 用户已配置sudo权限" ;;
+      ERR_SUDOERS_SYNTAX) echo "❌ sudoers文件语法错误，已删除" ;;
+      ERR_SUDOERS_PERM) echo "❌ 无法设置sudoers文件权限" ;;
+      INFO_SUDO_CONFIGURED) echo "✅ 为用户配置了sudo权限" ;;
+      WARN_SSH_PROTOCOL) echo "⚠️ SSH协议握手失败或超时" ;;
+      INFO_SSH_PROTOCOL_OK) echo "✅ SSH协议握手成功" ;;
+      WARN_PORT_OPEN_BUT_FAIL) echo "⚠️ 端口已打开，但SSH客户端连接失败" ;;
+      WARN_X11_FORWARDING) echo "⚠️ X11转发已启用，可能存在安全风险" ;;
+      WARN_EMPTY_PASSWORDS) echo "⚠️ 允许空密码，存在安全风险" ;;
+      WARN_INSECURE_OPTIONS) echo "⚠️ 发现潜在的不安全选项" ;;
+      ERR_DEADLOCK) echo "❌ 致命错误：密码和密钥认证同时被禁用，将导致锁定！" ;;
+      ERR_PASSWORD_NO_KEY) echo "❌ 致命错误：密码认证已禁用但未成功部署SSH密钥" ;;
+      ERR_ROOT_NO_KEY) echo "❌ 致命错误：root密码登录已禁用但未部署SSH密钥" ;;
+      WARN_PORT_MISMATCH) echo "⚠️ 配置中的端口与目标端口不匹配" ;;
+      ERR_CANNOT_RESERVE_PORT) echo "❌ 无法预留端口，端口可能已被占用" ;;
+      INFO_OLD_SSH_SKIP_ALGO) echo "ℹ️ OpenSSH较旧或无法检测支持列表：跳过现代加密算法强制配置" ;;
+      INFO_SANITIZE_DUP) echo "ℹ️ 清理原配置文件中的重复指令..." ;;
+      INFO_MATCH_INSERT) echo "ℹ️ 检测到 Match 块：托管配置将插入到首个 Match 之前，以避免语法/作用域问题" ;;
+      *) echo "$key" ;;
     esac
   else
-    # English Full Support
     case "$key" in
       MUST_ROOT)    echo "Must be run as root" ;;
-      BANNER)       echo "Server Init & SSH Hardening (v4.0.0 Platinum)" ;;
+      BANNER)       echo "Server Init & SSH Hardening (v4.5.1 Fortress Pro)" ;;
       STRICT_ON)    echo "STRICT mode ON: Critical errors will abort" ;;
       ASK_USER)     echo "SSH Login User (root or normal user, default " ;;
       ERR_USER_INV) echo "❌ Invalid username (lowercase/digits/underscore only, no reserved words)" ;;
@@ -227,7 +304,7 @@ msg() {
       I_USER)       echo "Configuring user..." ;;
       I_SSH_INSTALL) echo "OpenSSH not found, installing..." ;;
       I_KEY_OK)     echo "SSH Key deployed successfully" ;;
-      W_KEY_FAIL)   echo "Key deployment failed. Password login kept enabled to avoid lockout." ;;
+      W_KEY_FAIL)   echo "Key deployment failed; enabling fallback policy to avoid lockout" ;;
       I_BACKUP)     echo "Full backup created (SSH/User/Firewall): " ;;
       E_SSHD_CHK)   echo "sshd config validation failed, rolling back..." ;;
       E_GREP_FAIL)  echo "Config validation failed: Critical settings not active. Rolling back..." ;;
@@ -252,148 +329,157 @@ msg() {
       IPV6_CFG)     echo "Global IPv6 detected. Added listen address :: support." ;;
       SYS_PROT)     echo "Adding systemd service protection (anti-kill)..." ;;
       MOTD_UPD)     echo "Updating Message of the Day (MotD)..." ;;
-      COMPAT_WARN)  echo "Older OpenSSH detected. Adjusting compatibility settings..." ;;
+      COMPAT_WARN)  echo "Compatibility limits detected; adjusted configuration automatically..." ;;
       AUDIT_START)  echo "Starting audit logging..." ;;
       BOX_TITLE)    echo "Init Complete - Security Applied" ;;
       BOX_SSH)      echo "SSH Connection Info:" ;;
       BOX_KEY_ON)   echo "🔐 Key Auth: ENABLED (Password Disabled)" ;;
-      BOX_KEY_OFF)  echo "⚠️ Key Auth: DISABLED (Password Enabled)" ;;
+      BOX_KEY_OFF)  echo "⚠️ Key Auth: DISABLED (Password/Fallback Enabled)" ;;
       BOX_PORT)     echo "📍 Port Change: 22 → " ;;
       BOX_FW)       echo "⚠️  Verify Firewall Open for TCP Port" ;;
       BOX_WARN)     echo "IMPORTANT: Test connection in NEW window before closing this one!" ;;
       BOX_K8S_WARN) echo "⚠️  NOTE: Using K8s NodePort range" ;;
       ERR_MISSING)  echo "❌ Missing essential commands: " ;;
+      ERR_MISSING_SSHD) echo "❌ sshd command not found, please install OpenSSH Server first" ;;
       WARN_DISK)    echo "⚠️  Low disk space: " ;;
       WARN_MEM)     echo "⚠️  Low memory: " ;;
-      *)            echo "$key" ;;
+      WARN_RESUME)  echo "Detected incomplete initialization, last execution may have crashed" ;;
+      ASK_RESUME)   echo "Detected incomplete operation, continue? [y/N]: " ;;
+      ERR_BACKUP_DIR) echo "❌ Cannot create backup directory:" ;;
+      ERR_BACKUP_DIR_ALT) echo "❌ Cannot create alternative backup directory" ;;
+      ERR_BACKUP_SUBDIR) echo "❌ Cannot create backup subdirectory:" ;;
+      INFO_BACKUP_CREATED) echo "✅ Backup created:" ;;
+      INFO_CLEANING_BACKUPS) echo "🧹 Cleaning" ;;
+      INFO_OLD_BACKUPS) echo "old backups..." ;;
+      ERR_LOCK_DIR) echo "❌ Cannot create lock directory:" ;;
+      WARN_LOCK_DIR_PERM) echo "⚠️ Cannot set lock directory permissions, continuing..." ;;
+      WARN_CLEAN_LOCKS) echo "⚠️ Cleaning old lock files..." ;;
+      WARN_INVALID_KEY) echo "⚠️ Skipping invalid SSH key line" ;;
+      WARN_SHORT_RSA_KEY) echo "⚠️ RSA key too short:" ;;
+      WARN_SHORT_ED25519_KEY) echo "⚠️ Ed25519 key too short:" ;;
+      WARN_SHORT_DSA_KEY) echo "⚠️ DSA key too short:" ;;
+      ERR_INVALID_KEY_FORMAT) echo "❌ SSH key format invalid" ;;
+      ERR_MISSING_BASE64) echo "❌ SSH key missing base64 part" ;;
+      ERR_INVALID_BASE64) echo "❌ SSH key base64 encoding invalid" ;;
+      WARN_NO_BASE64_SKIPLEN) echo "⚠️ base64 not found: skipping key length checks (format-only validation)" ;;
+      WARN_USER_SHELL) echo "⚠️ User shell does not allow login:" ;;
+      ASK_CHANGE_SHELL) echo "Change user's shell to /bin/bash? [y/N]: " ;;
+      WARN_CHANGE_SHELL_FAIL) echo "⚠️ Failed to change shell" ;;
+      WARN_UNUSUAL_SHELL) echo "⚠️ User uses unusual shell:" ;;
+      WARN_HOME_OWNER) echo "⚠️ User home directory owner mismatch:" ;;
+      WARN_HOME_NOT_WRITABLE) echo "⚠️ User home directory not writable" ;;
+      ERR_USER_CREATE_FAIL) echo "❌ Failed to create user" ;;
+      ERR_USER_VERIFY_FAIL) echo "❌ User verification failed after creation" ;;
+      WARN_NO_SUDOERS_DIR) echo "⚠️ No /etc/sudoers.d directory, skipping sudo config" ;;
+      INFO_SUDO_EXISTS) echo "ℹ️ User already has sudo permissions" ;;
+      ERR_SUDOERS_SYNTAX) echo "❌ sudoers file syntax error, deleted" ;;
+      ERR_SUDOERS_PERM) echo "❌ Cannot set sudoers file permissions" ;;
+      INFO_SUDO_CONFIGURED) echo "✅ Configured sudo permissions for user" ;;
+      WARN_SSH_PROTOCOL) echo "⚠️ SSH protocol handshake failed or timed out" ;;
+      INFO_SSH_PROTOCOL_OK) echo "✅ SSH protocol handshake successful" ;;
+      WARN_PORT_OPEN_BUT_FAIL) echo "⚠️ Port is open but SSH client connection failed" ;;
+      WARN_X11_FORWARDING) echo "⚠️ X11 forwarding enabled, potential security risk" ;;
+      WARN_EMPTY_PASSWORDS) echo "⚠️ Empty passwords allowed, security risk" ;;
+      WARN_INSECURE_OPTIONS) echo "⚠️ Found potential insecure options" ;;
+      ERR_DEADLOCK) echo "❌ FATAL: Both password and key authentication disabled, will cause lockout!" ;;
+      ERR_PASSWORD_NO_KEY) echo "❌ FATAL: Password auth disabled but no SSH key deployed" ;;
+      ERR_ROOT_NO_KEY) echo "❌ FATAL: Root password login disabled but no SSH key deployed" ;;
+      WARN_PORT_MISMATCH) echo "⚠️ Port in config does not match target port" ;;
+      ERR_CANNOT_RESERVE_PORT) echo "❌ Cannot reserve port, port may be occupied" ;;
+      INFO_OLD_SSH_SKIP_ALGO) echo "ℹ️ Old OpenSSH or unable to detect supported lists: skipping forced crypto algorithms" ;;
+      INFO_SANITIZE_DUP) echo "ℹ️ Sanitizing duplicate directives in original config..." ;;
+      INFO_MATCH_INSERT) echo "ℹ️ Match blocks detected: inserting managed block before first Match to avoid scope issues" ;;
+      *) echo "$key" ;;
     esac
   fi
 }
 
+# ---------------- Logging & Audit ----------------
+init_log_files() {
+  for logfile in "$LOG_FILE" "$AUDIT_FILE"; do
+    if [ -f "$logfile" ]; then
+      if [ ! -w "$logfile" ]; then
+        logfile_new="${logfile}.$(date +%s)"
+        if touch "$logfile_new" 2>/dev/null; then
+          chmod 600 "$logfile_new" 2>/dev/null || true
+          if [ "$logfile" = "$LOG_FILE" ]; then
+            LOG_FILE="$logfile_new"
+          else
+            AUDIT_FILE="$logfile_new"
+          fi
+        fi
+      fi
+    else
+      touch "$logfile" 2>/dev/null || true
+      chmod 600 "$logfile" 2>/dev/null || true
+    fi
+  done
+}
+
+init_log_files
+
+log() { echo "$(date '+%F %T') $*" >>"$LOG_FILE" 2>/dev/null || true; }
+
+audit_log() {
+  action="$1"
+  details="$2"
+  {
+    echo "=== $(date '+%F %T') ==="
+    echo "ACTION: $action"
+    echo "USER: $(whoami 2>/dev/null || echo root)"
+    echo "DETAILS: $details"
+    echo "---"
+  } >> "$AUDIT_FILE" 2>/dev/null || true
+  log "[AUDIT] $action - $details"
+}
+
+info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; log "[INFO] $*"; }
+warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; log "[WARN] $*"; }
+err()  { printf "${RED}[ERR ]${NC} %s\n" "$*"; log "[ERR ] $*"; }
+ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; log "[OK] $*"; }
+die() { err "$*"; exit 1; }
+
 # =========================================================
-# Core Logic
+# Core Logic Functions
 # =========================================================
 
-# v4.0.0: Preflight Checks (POSIX compatible)
 preflight_checks() {
-    # Check essential commands
-    essential_cmds="cat grep awk sed cp mv chmod chown mkdir rm"
-    missing_cmds=""
-    
-    for cmd in $essential_cmds; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing_cmds="$missing_cmds $cmd"
-        fi
-    done
-    
-    if [ -n "$missing_cmds" ]; then
-        die "$(msg ERR_MISSING)$missing_cmds"
-    fi
-    
-    # Check Disk Space (Need ~5MB)
-    available_kb=$(df -k / | awk 'NR==2 {print $4}' 2>/dev/null || echo 99999)
-    if [ "$available_kb" -lt 5120 ]; then
-        warn "$(msg WARN_DISK)${available_kb}KB"
-    fi
-    
-    # Check Memory (Need ~50MB)
-    if [ -f /proc/meminfo ]; then
-        mem_avail=$(grep MemAvailable /proc/meminfo | awk '{print $2}' 2>/dev/null || echo 999999)
-        if [ "$mem_avail" -lt 51200 ]; then
-             warn "$(msg WARN_MEM)${mem_avail}KB"
-        fi
-    fi
-}
+  essential_cmds="cat grep awk sed cp mv chmod chown mkdir rm id"
+  extended_cmds="wc tr head cut touch find sleep date df uname tail"
 
-# ---------------- Robust Rollback ----------------
-# Use secure temp dir for backups too
-ROLLBACK_DIR="$TMP_DIR/rollback"
-setup_rollback() {
-  mkdir -p "$ROLLBACK_DIR"
-  
-  # 1. Config Backup
-  [ -f "$SSH_CONF" ] && cp -p "$SSH_CONF" "$ROLLBACK_DIR/sshd_config"
-  if [ -d "$SSH_CONF_D" ]; then
-    mkdir -p "$ROLLBACK_DIR/sshd_config.d"
-    cp -p "$SSH_CONF_D"/* "$ROLLBACK_DIR/sshd_config.d/" 2>/dev/null || true
+  missing_cmds=""
+  for cmd in $essential_cmds; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_cmds="$missing_cmds $cmd"
+    fi
+  done
+  if [ -n "$missing_cmds" ]; then
+    die "$(msg ERR_MISSING)$missing_cmds"
   fi
 
-  # 2. User/Shadow Backup
-  cp -p /etc/passwd /etc/shadow /etc/group "$ROLLBACK_DIR/" 2>/dev/null || true
-  [ -d /etc/sudoers.d ] && cp -rp /etc/sudoers.d "$ROLLBACK_DIR/" 2>/dev/null || true
-
-  # 3. Firewall State Backup
-  if command -v iptables-save >/dev/null 2>&1; then
-    iptables-save > "$ROLLBACK_DIR/iptables.backup" 2>/dev/null || true
-  fi
-  
-  # Catch signals (Wait for exit code in handler)
-  trap 'rollback_handler' INT TERM EXIT HUP
-}
-
-# v4.0.0: Persistent Versioned Backup with Metadata
-backup_config_persistent() {
-  timestamp=$(date +%Y%m%d_%H%M%S)
-  mkdir -p "$BACKUP_REPO"
-  chmod 700 "$BACKUP_REPO" 2>/dev/null || true
-
-  if [ -f "$SSH_CONF" ]; then
-      cp -p "$SSH_CONF" "$BACKUP_REPO/sshd_config.$timestamp"
-      chmod 600 "$BACKUP_REPO/sshd_config.$timestamp" 2>/dev/null || true
-      
-      # Generate Metadata
-      cat > "$BACKUP_REPO/sshd_config.$timestamp.meta" <<EOF
-Backup-Time: $(date)
-SSH-Port: $SSH_PORT
-User: $TARGET_USER
-Key-Auth: $KEY_OK
-Script-Version: 4.0.0
-EOF
-      chmod 600 "$BACKUP_REPO/sshd_config.$timestamp.meta" 2>/dev/null || true
-  fi
-  
-  # Keep last 10 backups (exclude meta files in count, remove both)
-  ls -t "$BACKUP_REPO"/sshd_config.* 2>/dev/null | grep -v '\.meta$' | tail -n +11 | \
-    while read -r backup; do
-        rm -f "$backup" "${backup}.meta" 2>/dev/null || true
-    done
-}
-
-rollback_handler() {
-  RET=$? # Capture exit code immediately
-  trap - INT TERM EXIT HUP # Disable trap
-  
-  # Only rollback on error (RET != 0)
-  if [ "$RET" -ne 0 ]; then
-    warn ""
-    warn "$(msg RB_START)"
-    
-    # Restore SSH Config
-    if [ -f "$ROLLBACK_DIR/sshd_config" ]; then
-      cp -p "$ROLLBACK_DIR/sshd_config" "$SSH_CONF"
-      chmod 600 "$SSH_CONF"
+  for cmd in $extended_cmds; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      warn "Optional command not found: $cmd (some features may be limited)"
     fi
-    
-    # Restore .d configs
-    if [ -d "$ROLLBACK_DIR/sshd_config.d" ]; then
-      cp -p "$ROLLBACK_DIR/sshd_config.d"/* "$SSH_CONF_D/" 2>/dev/null || true
-    fi
+  done
 
-    # Attempt restart to restore service
-    restart_sshd >/dev/null 2>&1
-    
-    warn "$(msg RB_DONE)"
-    audit_log "ROLLBACK" "System rolled back due to error code $RET"
-  else
-    # Success cleanup - Remove the whole temp dir
-    rm -rf "$TMP_DIR"
+  # [FIX] Guard against empty value in numeric comparison
+  available_kb=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}' 2>/dev/null || echo "")
+  if [ -n "$available_kb" ] && [ "$available_kb" -lt 5120 ] 2>/dev/null; then
+    warn "$(msg WARN_DISK)${available_kb}KB"
   fi
-  
-  exit "$RET"
-}
 
-[ "$(id -u)" -eq 0 ] || { echo "$(msg MUST_ROOT)"; exit 1; }
-audit_log "START" "Script started with args: $*"
+  if [ -f /proc/meminfo ]; then
+    mem_avail=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}' 2>/dev/null || echo "")
+    if [ -n "$mem_avail" ] && [ "$mem_avail" -lt 51200 ] 2>/dev/null; then
+      warn "$(msg WARN_MEM)${mem_avail}KB"
+    fi
+  fi
+
+  if ! command -v base64 >/dev/null 2>&1; then
+    warn "$(msg WARN_NO_BASE64_SKIPLEN)"
+  fi
+}
 
 # ---------------- Package Manager ----------------
 detect_pm() {
@@ -402,6 +488,7 @@ detect_pm() {
   [ -f /etc/redhat-release ] && { echo yum; return; }
   echo unknown
 }
+
 PM="$(detect_pm)"
 APT_UPDATED="n"
 APK_UPDATED="n"
@@ -409,11 +496,11 @@ YUM_PREPARED="n"
 
 pm_prepare_once() {
   case "$PM" in
-    apt) [ "$APT_UPDATED" != "y" ] && { apt-get update -y >>"$LOG_FILE" 2>&1; APT_UPDATED="y"; } ;;
+    apt) [ "$APT_UPDATED" != "y" ] && { apt-get update -y >>"$LOG_FILE" 2>&1 || true; APT_UPDATED="y"; } ;;
     apk) [ "$APK_UPDATED" != "y" ] && { apk update >>"$LOG_FILE" 2>&1 || true; APK_UPDATED="y"; } ;;
-    yum) [ "$YUM_PREPARED" != "y" ] && { 
-         if command -v dnf >/dev/null 2>&1; then dnf makecache -y >>"$LOG_FILE" 2>&1;
-         else yum makecache -y >>"$LOG_FILE" 2>&1; fi
+    yum) [ "$YUM_PREPARED" != "y" ] && {
+         if command -v dnf >/dev/null 2>&1; then dnf makecache -y >>"$LOG_FILE" 2>&1 || true;
+         else yum makecache -y >>"$LOG_FILE" 2>&1 || true; fi
          YUM_PREPARED="y"; } ;;
   esac
 }
@@ -421,10 +508,11 @@ pm_prepare_once() {
 install_pkg() {
   case "$PM" in
     apt) pm_prepare_once; DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >>"$LOG_FILE" 2>&1 ;;
-    yum) pm_prepare_once; 
+    yum) pm_prepare_once;
          if command -v dnf >/dev/null 2>&1; then dnf install -y "$@" >>"$LOG_FILE" 2>&1;
          else yum install -y "$@" >>"$LOG_FILE" 2>&1; fi ;;
     apk) pm_prepare_once; apk add --no-cache "$@" >>"$LOG_FILE" 2>&1 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -435,23 +523,229 @@ install_pkg_try() {
   return 1
 }
 
-# ---------------- System Update ----------------
 update_system() {
   case "$PM" in
     apt) pm_prepare_once; DEBIAN_FRONTEND=noninteractive apt-get upgrade -y >>"$LOG_FILE" 2>&1 ;;
-    yum) pm_prepare_once; 
+    yum) pm_prepare_once;
          if command -v dnf >/dev/null 2>&1; then dnf upgrade -y >>"$LOG_FILE" 2>&1;
          else yum update -y >>"$LOG_FILE" 2>&1; fi ;;
     apk) pm_prepare_once; apk upgrade >>"$LOG_FILE" 2>&1 ;;
   esac
 }
 
+# ---------------- SSHD Restart ----------------
+restart_sshd() {
+  if [ "$ARG_DELAY_RESTART" = "y" ]; then
+    warn "DELAY RESTART: Please manually restart sshd later."
+    return 0
+  fi
+
+  res=1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart sshd >>"$LOG_FILE" 2>&1 || systemctl restart ssh >>"$LOG_FILE" 2>&1
+    res=$?
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service sshd restart >>"$LOG_FILE" 2>&1
+    res=$?
+  elif command -v service >/dev/null 2>&1; then
+    service sshd restart >>"$LOG_FILE" 2>&1 || service ssh restart >>"$LOG_FILE" 2>&1
+    res=$?
+  else
+    if [ -x /etc/init.d/sshd ]; then /etc/init.d/sshd restart >>"$LOG_FILE" 2>&1 && res=0; fi
+    if [ -x /etc/init.d/ssh  ]; then /etc/init.d/ssh  restart >>"$LOG_FILE" 2>&1 && res=0; fi
+  fi
+
+  if [ "$res" -ne 0 ]; then
+    if [ "$STRICT_MODE" = "y" ]; then
+      die "SSHD Restart Failed (Exit Code: $res)"
+    else
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# ---------------- Robust Rollback ----------------
+ROLLBACK_DIR="$TMP_DIR/rollback"
+
+update_state() {
+  phase="$1"
+  details="${2:-}"
+  {
+    echo "PHASE=$phase"
+    echo "TIMESTAMP=$(date +%s)"
+    echo "USER=${TARGET_USER:-unknown}"
+    echo "PORT=${SSH_PORT:-22}"
+    echo "KEY_OK=${KEY_OK:-n}"
+    echo "DETAILS=$details"
+  } > "$STATE_FILE" 2>/dev/null || true
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+}
+
+check_previous_state() {
+  if [ -f "$STATE_FILE" ]; then
+    warn "$(msg WARN_RESUME)"
+    if [ -r "$STATE_FILE" ]; then
+      # shellcheck disable=SC1090
+      . "$STATE_FILE" 2>/dev/null || true
+      if [ "$AUTO_CONFIRM" != "y" ]; then
+        printf "%s" "$(msg ASK_RESUME)"
+        read -r continue_resume
+        if [ "${continue_resume:-n}" != "y" ]; then
+          rm -f "$STATE_FILE" 2>/dev/null || true
+          exit 1
+        fi
+      fi
+    fi
+  fi
+}
+
+cleanup_state() { rm -f "$STATE_FILE" 2>/dev/null || true; }
+
+cleanup_locks() {
+  if [ -n "${LOCK_DIR:-}" ] && [ -d "$LOCK_DIR" ]; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+  fi
+}
+
+rollback_handler() {
+  RET=$?
+  trap - INT TERM EXIT HUP
+
+  if [ "$RET" -ne 0 ]; then
+    warn ""
+    warn "$(msg RB_START)"
+
+    if [ -f "$ROLLBACK_DIR/sshd_config" ]; then
+      cp -p "$ROLLBACK_DIR/sshd_config" "$SSH_CONF" 2>/dev/null || true
+      chmod 600 "$SSH_CONF" 2>/dev/null || true
+    fi
+
+    if [ -d "$ROLLBACK_DIR/sshd_config.d" ] && [ -d "$SSH_CONF_D" ]; then
+      for f in "$ROLLBACK_DIR/sshd_config.d"/*; do
+        [ -f "$f" ] || continue
+        cp -p "$f" "$SSH_CONF_D"/ 2>/dev/null || true
+      done
+    fi
+
+    restart_sshd >/dev/null 2>&1 || true
+    warn "$(msg RB_DONE)"
+    audit_log "ROLLBACK" "System rolled back due to error code $RET"
+  else
+    rm -rf "$TMP_DIR" 2>/dev/null || true
+  fi
+
+  cleanup_locks
+  exit "$RET"
+}
+
+setup_rollback() {
+  mkdir -p "$ROLLBACK_DIR" 2>/dev/null || true
+
+  check_previous_state
+  update_state "setup" "Init"
+
+  [ -f "$SSH_CONF" ] && cp -p "$SSH_CONF" "$ROLLBACK_DIR/sshd_config" 2>/dev/null || true
+  if [ -d "$SSH_CONF_D" ]; then
+    mkdir -p "$ROLLBACK_DIR/sshd_config.d" 2>/dev/null || true
+    for f in "$SSH_CONF_D"/*; do
+      [ -f "$f" ] || continue
+      cp -p "$f" "$ROLLBACK_DIR/sshd_config.d/" 2>/dev/null || true
+    done
+  fi
+
+  if command -v iptables-save >/dev/null 2>&1; then
+    iptables-save > "$ROLLBACK_DIR/iptables.backup" 2>/dev/null || true
+  fi
+
+  trap 'rollback_handler' INT TERM EXIT HUP
+}
+
+# ---------------- Persistent Backup ----------------
+cleanup_old_backups() {
+  keep_count=10
+  if [ -d "$BACKUP_REPO" ]; then
+    backup_list=$(ls -dt "$BACKUP_REPO"/*/ 2>/dev/null) || return 0
+    count=$(echo "$backup_list" | grep -c . 2>/dev/null || echo 0)
+    if [ -n "$count" ] && [ "$count" -gt "$keep_count" ] 2>/dev/null; then
+      to_rm=$((count - keep_count))
+      info "$(msg INFO_CLEANING_BACKUPS) $to_rm $(msg INFO_OLD_BACKUPS)"
+      echo "$backup_list" | tail -n "$to_rm" | while IFS= read -r d; do
+        [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d" 2>/dev/null || true
+      done
+    fi
+  fi
+}
+
+backup_config_persistent() {
+  timestamp=$(date +%Y%m%d_%H%M%S)
+  if command -v date >/dev/null 2>&1 && date --version 2>&1 | grep -q GNU; then
+    timestamp=$(date +%Y%m%d_%H%M%S%N 2>/dev/null || echo "$timestamp")
+  fi
+
+  backup_dir="$BACKUP_REPO/$timestamp"
+
+  if ! mkdir -p "$BACKUP_REPO" 2>/dev/null; then
+    warn "$(msg ERR_BACKUP_DIR) $BACKUP_REPO"
+    BACKUP_REPO="/tmp/server-init-backups"
+    backup_dir="$BACKUP_REPO/$timestamp"
+    mkdir -p "$BACKUP_REPO" 2>/dev/null || {
+      warn "$(msg ERR_BACKUP_DIR_ALT)"
+      return 1
+    }
+  fi
+
+  if ! mkdir -p "$backup_dir" 2>/dev/null; then
+    warn "$(msg ERR_BACKUP_SUBDIR) $backup_dir"
+    return 1
+  fi
+
+  chmod 700 "$backup_dir" 2>/dev/null || true
+
+  if [ -f "$SSH_CONF" ]; then
+    cp -p "$SSH_CONF" "$backup_dir/sshd_config" 2>/dev/null || true
+    chmod 600 "$backup_dir/sshd_config" 2>/dev/null || true
+  fi
+
+  {
+    echo "=== Server Init Backup ==="
+    echo "Time: $(date)"
+    echo "Version: 4.5.1"
+    echo "User: ${TARGET_USER:-unknown}"
+    echo "Port: ${SSH_PORT:-unknown}"
+    echo "OpenSSH: ${OPENSSH_VER_MAJOR}.${OPENSSH_VER_MINOR}"
+    echo "--- System ---"
+    uname -a 2>/dev/null || true
+  } > "$backup_dir/backup.info" 2>/dev/null || true
+
+  cat > "$backup_dir/restore.sh" <<'EOF'
+#!/bin/sh
+set -e
+BACKUP_DIR=$(dirname "$0")
+SSH_CONFIG="/etc/ssh/sshd_config"
+echo "Restoring SSH Config..."
+[ -f "$BACKUP_DIR/sshd_config" ] || exit 1
+cp -p "$SSH_CONFIG" "$SSH_CONFIG.bak-$(date +%s)" 2>/dev/null || true
+cp -p "$BACKUP_DIR/sshd_config" "$SSH_CONFIG"
+chmod 600 "$SSH_CONFIG" 2>/dev/null || true
+systemctl restart sshd 2>/dev/null || service sshd restart 2>/dev/null || true
+echo "Done."
+EOF
+  chmod +x "$backup_dir/restore.sh" 2>/dev/null || true
+
+  (cd "$backup_dir" && sha256sum * 2>/dev/null > checksums.sha256) || true
+
+  cleanup_old_backups
+  info "$(msg INFO_BACKUP_CREATED) $backup_dir"
+  return 0
+}
+
 # ---------------- BBR ----------------
 enable_bbr() {
-  command -v sysctl >/dev/null 2>&1 || return
+  command -v sysctl >/dev/null 2>&1 || return 0
   if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
     warn "Kernel does not support BBR, skipping."
-    return
+    return 0
   fi
   sysctl_conf="/etc/sysctl.conf"
   grep -q '^net.core.default_qdisc=fq$' "$sysctl_conf" 2>/dev/null || echo 'net.core.default_qdisc=fq' >>"$sysctl_conf"
@@ -461,12 +755,18 @@ enable_bbr() {
 
 # ---------------- SSHD Helpers ----------------
 ensure_ssh_server() {
-  [ -f "$SSH_CONF" ] && return 0
+  if [ -f "$SSH_CONF" ] && command -v sshd >/dev/null 2>&1; then
+    return 0
+  fi
   info "$(msg I_SSH_INSTALL)"
   case "$PM" in
-    apk) install_pkg openssh ;;
+    apk) install_pkg openssh openssh-server ;;
     *)   install_pkg openssh-server ;;
   esac
+
+  if ! command -v sshd >/dev/null 2>&1; then
+    die "$(msg ERR_MISSING_SSHD)"
+  fi
   [ -f "$SSH_CONF" ] || die "OpenSSH Install Failed"
 }
 
@@ -475,7 +775,6 @@ protect_sshd_service() {
     info "$(msg SYS_PROT)"
     systemctl enable ssh sshd 2>/dev/null || true
     systemctl unmask ssh sshd 2>/dev/null || true
-    
     mkdir -p /etc/systemd/system/sshd.service.d/ 2>/dev/null || true
     cat > /etc/systemd/system/sshd.service.d/override.conf <<EOF
 [Service]
@@ -487,153 +786,98 @@ EOF
   fi
 }
 
-restart_sshd() {
-  if [ "$ARG_DELAY_RESTART" = "y" ]; then
-     warn "DELAY RESTART: Please manually restart sshd later."
-     return 0
+# [FIX] Detect OpenSSH version using sed (POSIX compatible, no gawk match())
+detect_openssh_version() {
+  OPENSSH_VER_MAJOR=0
+  OPENSSH_VER_MINOR=0
+  ver_str=""
+
+  if command -v sshd >/dev/null 2>&1; then
+    ver_str=$(sshd -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9]*\)\.\([0-9]*\).*/\1.\2/p' | head -1)
   fi
 
-  local res=1
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart sshd >>"$LOG_FILE" 2>&1 || systemctl restart ssh >>"$LOG_FILE" 2>&1
-    res=$?
-  elif command -v rc-service >/dev/null 2>&1; then
-    rc-service sshd restart >>"$LOG_FILE" 2>&1
-    res=$?
-  elif command -v service >/dev/null 2>&1; then
-    service sshd restart >>"$LOG_FILE" 2>&1 || service ssh restart >>"$LOG_FILE" 2>&1
-    res=$?
-  else
-    [ -x /etc/init.d/sshd ] && /etc/init.d/sshd restart >>"$LOG_FILE" 2>&1 && res=0
-    [ -x /etc/init.d/ssh ]  && /etc/init.d/ssh  restart >>"$LOG_FILE" 2>&1 && res=0
+  if [ -z "$ver_str" ] && command -v ssh >/dev/null 2>&1; then
+    ver_str=$(ssh -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9]*\)\.\([0-9]*\).*/\1.\2/p' | head -1)
   fi
 
-  if [ "$res" -ne 0 ]; then
-     if [ "$STRICT_MODE" = "y" ]; then
-        die "SSHD Restart Failed (Exit Code: $res)"
-     else
-        return 1
-     fi
+  if [ -n "$ver_str" ]; then
+    OPENSSH_VER_MAJOR=$(echo "$ver_str" | cut -d. -f1 2>/dev/null || echo 0)
+    OPENSSH_VER_MINOR=$(echo "$ver_str" | cut -d. -f2 2>/dev/null || echo 0)
   fi
-  return 0
+
+  # [FIX] Proper numeric check
+  case "$OPENSSH_VER_MAJOR" in
+    ''|*[!0-9]*) OPENSSH_VER_MAJOR=7 ;;
+  esac
+  case "$OPENSSH_VER_MINOR" in
+    ''|*[!0-9]*) OPENSSH_VER_MINOR=0 ;;
+  esac
+  [ "$OPENSSH_VER_MAJOR" -eq 0 ] 2>/dev/null && OPENSSH_VER_MAJOR=7
 }
 
-verify_sshd_listening() {
-  local port="$1"
-  local timeout=10
-  local elapsed=0
-  
-  ensure_port_tools
-  
-  while [ $elapsed -lt $timeout ]; do
-    if ! is_port_free "$port"; then
-       # Port is occupied, which means SSHD (or something) is up
-       return 0
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
+openssh_version_ge() {
+  req_major="$1"
+  req_minor="${2:-0}"
+
+  [ "$OPENSSH_VER_MAJOR" -gt "$req_major" ] && return 0
+  [ "$OPENSSH_VER_MAJOR" -eq "$req_major" ] && [ "$OPENSSH_VER_MINOR" -ge "$req_minor" ] && return 0
   return 1
 }
 
-# v4.0.0: Robust Connection Testing with Fallback
-test_ssh_connection() {
-  port="$1"
-  user="$2"
-  info "$(msg TEST_CONN)"
-  
-  sleep 2
-  
-  # Try to install clients if missing
-  if ! command -v ssh >/dev/null 2>&1; then
-    install_pkg_try openssh-clients openssh-client >/dev/null 2>&1 || true
-  fi
-
-  # Determine IPv6 capability for testing
-  local targets="127.0.0.1 localhost"
-  if has_global_ipv6; then targets="$targets ::1"; fi
-
-  # METHOD 1: SSH Client
-  if command -v ssh >/dev/null 2>&1; then
-    for target in $targets; do
-      if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -p "$port" "$user"@"$target" "echo ok" >/dev/null 2>&1; then
-        ok "$(msg TEST_OK) ($target via SSH)"
-        return 0
-      fi
-    done
-  fi
-
-  # METHOD 2: Netcat (Fallback if keyauth fails or client missing)
-  if command -v nc >/dev/null 2>&1; then
-     # Use first target for port check
-     if nc -z -w 5 127.0.0.1 "$port" 2>/dev/null; then
-        ok "SSH port $port is open (verified via Netcat)"
-        return 0
-     fi
-  fi
-
-  err "$(msg TEST_FAIL)"
-  return 1
-}
-
-# ---------------- Firewall & SELinux ----------------
+# ---------------- Firewall / SELinux ----------------
 allow_firewall_port() {
   p="$1"
-  # IPv4
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "${p}/tcp" >>"$LOG_FILE" 2>&1 || true
   elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port="${p}/tcp" >>"$LOG_FILE" 2>&1 || true
     firewall-cmd --reload >>"$LOG_FILE" 2>&1 || true
   elif command -v iptables >/dev/null 2>&1; then
-    iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>>"$LOG_FILE" || true
+    iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>>"$LOG_FILE" || true
   fi
-  
-  # IPv6
+
   if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>>"$LOG_FILE" || true
+    ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>>"$LOG_FILE" || true
   fi
 }
 
 handle_selinux() {
   port="$1"
   if command -v getenforce >/dev/null 2>&1; then
-    if getenforce | grep -qi "Enforcing"; then
-       info "$(msg SELINUX_DET)"
-       
-       if ! command -v semanage >/dev/null 2>&1; then
-         info "$(msg SELINUX_INS)"
-         case "$PM" in
-           yum) install_pkg_try policycoreutils-python-utils policycoreutils-python ;;
-           apt) install_pkg_try policycoreutils python3-policycoreutils ;;
-         esac
-       fi
-
-       if command -v semanage >/dev/null 2>&1; then
-         if semanage port -a -t ssh_port_t -p tcp "$port" >>"$LOG_FILE" 2>&1 || \
-            semanage port -m -t ssh_port_t -p tcp "$port" >>"$LOG_FILE" 2>&1; then
-            ok "$(msg SELINUX_OK)"
-         else
-            warn "$(msg SELINUX_FAIL)"
-         fi
-       else
-         warn "$(msg SELINUX_FAIL)"
-       fi
+    if getenforce 2>/dev/null | grep -qi "Enforcing"; then
+      info "$(msg SELINUX_DET)"
+      if ! command -v semanage >/dev/null 2>&1; then
+        info "$(msg SELINUX_INS)"
+        case "$PM" in
+          yum) install_pkg_try policycoreutils-python-utils policycoreutils-python ;;
+          apt) install_pkg_try policycoreutils python3-policycoreutils ;;
+        esac
+      fi
+      if command -v semanage >/dev/null 2>&1; then
+        if semanage port -a -t ssh_port_t -p tcp "$port" >>"$LOG_FILE" 2>&1 || \
+           semanage port -m -t ssh_port_t -p tcp "$port" >>"$LOG_FILE" 2>&1; then
+          ok "$(msg SELINUX_OK)"
+        else
+          warn "$(msg SELINUX_FAIL)"
+        fi
+      else
+        warn "$(msg SELINUX_FAIL)"
+      fi
     fi
   fi
 }
 
 # ---------------- Port Logic ----------------
+# [FIX] Removed 22 from hard-reserved list (it's the default SSH port)
 is_hard_reserved() {
   case "$1" in
-    80|443|3306|5432|6379|8080|8443|21|23|25|110|143) return 0 ;;
+    53|80|443|3306)
+      return 0 ;;
   esac
   return 1
 }
 
-is_k8s_nodeport() {
-  [ "$1" -ge 30000 ] && [ "$1" -le 32767 ]
-}
+is_k8s_nodeport() { [ "$1" -ge 30000 ] && [ "$1" -le 32767 ]; }
 
 rand_u16() {
   if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
@@ -658,140 +902,317 @@ ensure_port_tools() {
 
 is_port_free() {
   p="$1"
+
   if command -v ss >/dev/null 2>&1; then
-    # Reliable parsing for IPv4 (0.0.0.0:22) and IPv6 ([::]:22)
     if ss -lnt 2>/dev/null | awk -v port="$p" '
-      {
+      NR > 1 {
         n = split($4, parts, ":")
-        last = parts[n]
-        if (last == port) { found=1; exit }
+        if (parts[n] == port) { exit 0 }
       }
-      END { exit !found }
+      END { exit 1 }
     '; then
-       return 1 # Found (Occupied)
-    else
-       return 0 # Free
+      return 1
     fi
+    return 0
   fi
-  # Fallback
+
   if command -v netstat >/dev/null 2>&1; then
-    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$" && return 1 || return 0
+    if netstat -lnt 2>/dev/null | awk -v port="$p" '
+      NR > 2 {
+        n = split($4, parts, ":")
+        if (parts[n] == port) { exit 0 }
+      }
+      END { exit 1 }
+    '; then
+      return 1
+    fi
+    return 0
   fi
-  return 1 # Conservative fail
+
+  return 1
 }
 
 pick_random_port() {
   ensure_port_tools
   i=0
-  while [ $i -lt 100 ]; do
+
+  if ! mkdir -p "$LOCK_DIR" 2>/dev/null; then
+    warn "$(msg ERR_LOCK_DIR) $LOCK_DIR"
+    return 1
+  fi
+  chmod 700 "$LOCK_DIR" 2>/dev/null || warn "$(msg WARN_LOCK_DIR_PERM)"
+  find "$LOCK_DIR" -name "port-*.lock" -mmin +5 -delete 2>/dev/null || true
+
+  while [ "$i" -lt 100 ]; do
     r="$(rand_u16)"
-    # Logic: 49152 + (0 to 16383) = 49152 to 65535.
-    # This range is strictly above K8s NodePort (30000-32767).
     p=$(( 49152 + (r % (65535 - 49152)) ))
-    
-    if is_port_free "$p"; then echo "$p"; return 0; fi
+    lockfile="$LOCK_DIR/port-$p.lock"
+    if mkdir "$lockfile" 2>/dev/null; then
+      if is_port_free "$p"; then
+        echo "$p"
+        return 0
+      else
+        rmdir "$lockfile" 2>/dev/null || true
+      fi
+    fi
     i=$((i+1))
   done
+
+  warn "$(msg ERR_CANNOT_RESERVE_PORT)"
   return 1
 }
 
-# ---------------- User & Key ----------------
+# ---------------- User & Sudo ----------------
 validate_username() {
-    u="$1"
-    # Length 2-32
-    len=${#u}
-    if [ "$len" -lt 2 ] || [ "$len" -gt 32 ]; then return 1; fi
-    # Regex: Lowercase, digits, underscore, dash. Must start with letter/underscore.
-    echo "$u" | grep -Eq '^[a-z_][a-z0-9_-]*$' || return 1
-    # Reserved words
-    case "$u" in
-        root|bin|daemon|adm|lp|sync|shutdown|halt|mail|operator|games|ftp|nobody) return 1 ;;
-    esac
-    return 0
-}
-
-ensure_user() {
   u="$1"
-  [ "$u" = "root" ] && return 0
-  id "$u" >/dev/null 2>&1 && return 0
-
-  info "$(msg I_USER) $u"
-  install_pkg_try bash sudo >/dev/null 2>&1 || true
-  shell="/bin/sh"
-  [ -x /bin/bash ] && shell="/bin/bash"
-
-  if command -v useradd >/dev/null 2>&1; then
-    useradd -m -s "$shell" "$u"
-  else
-    adduser -D -s "$shell" "$u"
-  fi
-
-  if [ -d /etc/sudoers.d ]; then
-    echo "$u ALL=(ALL) NOPASSWD:ALL" >"/etc/sudoers.d/$u" 2>/dev/null || true
-    chmod 440 "/etc/sudoers.d/$u" 2>/dev/null || true
-  fi
+  len=${#u}
+  [ "$len" -ge 2 ] && [ "$len" -le 32 ] || return 1
+  echo "$u" | grep -Eq '^[a-z_][a-z0-9_-]*$' || return 1
+  case "$u" in root|bin|daemon|adm|lp|sync|shutdown|halt|mail|operator|games|ftp|nobody) return 1 ;; esac
+  return 0
 }
 
+safe_configure_sudo() {
+  user="$1"
+  if [ ! -d /etc/sudoers.d ]; then warn "$(msg WARN_NO_SUDOERS_DIR)"; return 0; fi
+  if grep -q "^[[:space:]]*$user" /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then info "$(msg INFO_SUDO_EXISTS)"; return 0; fi
+
+  timestamp=$(date +%Y%m%d%H%M%S)
+  sudoers_file="/etc/sudoers.d/server-init-$user-$timestamp"
+  cat > "$sudoers_file" <<EOF
+# Generated by server-init
+$user ALL=(ALL) NOPASSWD:ALL
+Defaults:$user !requiretty
+Defaults:$user env_keep += "SSH_AUTH_SOCK"
+EOF
+
+  if command -v visudo >/dev/null 2>&1; then
+    if ! visudo -c -f "$sudoers_file" >/dev/null 2>&1; then
+      rm -f "$sudoers_file"
+      err "$(msg ERR_SUDOERS_SYNTAX)"
+      return 1
+    fi
+  fi
+  chmod 440 "$sudoers_file" 2>/dev/null || { rm -f "$sudoers_file"; err "$(msg ERR_SUDOERS_PERM)"; return 1; }
+  info "$(msg INFO_SUDO_CONFIGURED)"
+  return 0
+}
+
+get_user_home() {
+  user="$1"
+  home=""
+
+  if command -v getent >/dev/null 2>&1; then
+    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+  fi
+
+  if [ -z "$home" ] && [ -r /etc/passwd ]; then
+    home=$(awk -F: -v u="$user" '$1==u {print $6}' /etc/passwd 2>/dev/null)
+  fi
+
+  if [ -z "$home" ]; then
+    if [ "$user" = "root" ]; then
+      home="/root"
+    else
+      home="/home/$user"
+    fi
+  fi
+
+  echo "$home"
+}
+
+get_user_shell() {
+  user="$1"
+  shell=""
+
+  if command -v getent >/dev/null 2>&1; then
+    shell=$(getent passwd "$user" 2>/dev/null | cut -d: -f7)
+  fi
+
+  if [ -z "$shell" ] && [ -r /etc/passwd ]; then
+    shell=$(awk -F: -v u="$user" '$1==u {print $7}' /etc/passwd 2>/dev/null)
+  fi
+
+  echo "$shell"
+}
+
+safe_ensure_user() {
+  user="$1"
+  [ "$user" = "root" ] && return 0
+
+  if id "$user" >/dev/null 2>&1; then
+    shell=$(get_user_shell "$user")
+    home_dir=$(get_user_home "$user")
+
+    case "$shell" in
+      /bin/bash|/bin/sh|/usr/bin/bash|/usr/bin/sh|/bin/dash|/bin/ash) ;;
+      /sbin/nologin|/bin/false|/usr/sbin/nologin)
+        warn "$(msg WARN_USER_SHELL) $shell"
+        if [ "$AUTO_CONFIRM" != "y" ]; then
+          printf "%s" "$(msg ASK_CHANGE_SHELL)"
+          read -r change_shell
+          if [ "${change_shell:-n}" = "y" ]; then
+            new_shell="/bin/sh"
+            for try_shell in /bin/bash /bin/ash /bin/sh; do
+              [ -x "$try_shell" ] && { new_shell="$try_shell"; break; }
+            done
+            if command -v chsh >/dev/null 2>&1; then
+              chsh -s "$new_shell" "$user" 2>>"$LOG_FILE" || warn "$(msg WARN_CHANGE_SHELL_FAIL)"
+            elif command -v usermod >/dev/null 2>&1; then
+              usermod -s "$new_shell" "$user" 2>>"$LOG_FILE" || warn "$(msg WARN_CHANGE_SHELL_FAIL)"
+            else
+              warn "$(msg WARN_CHANGE_SHELL_FAIL)"
+            fi
+          fi
+        fi
+        ;;
+      "") ;;
+      *) warn "$(msg WARN_UNUSUAL_SHELL) $shell" ;;
+    esac
+
+    if [ -n "$home_dir" ] && [ -d "$home_dir" ]; then
+      dir_owner=""
+      if stat -c "%U" "$home_dir" >/dev/null 2>&1; then
+        dir_owner=$(stat -c "%U" "$home_dir" 2>/dev/null)
+      else
+        dir_owner=$(ls -ld "$home_dir" 2>/dev/null | awk '{print $3}')
+      fi
+      [ -n "$dir_owner" ] && [ "$dir_owner" != "$user" ] && warn "$(msg WARN_HOME_OWNER) $dir_owner"
+      [ ! -w "$home_dir" ] && warn "$(msg WARN_HOME_NOT_WRITABLE)"
+    fi
+    return 0
+  fi
+
+  info "$(msg I_USER) $user"
+  shell="/bin/sh"
+  for test_shell in /bin/bash /usr/bin/bash /bin/ash /bin/sh /usr/bin/sh /bin/dash; do
+    if [ -x "$test_shell" ]; then shell="$test_shell"; break; fi
+  done
+
+  user_created=0
+  if command -v useradd >/dev/null 2>&1; then
+    useradd -m -s "$shell" "$user" >>"$LOG_FILE" 2>&1 && user_created=1
+  elif command -v adduser >/dev/null 2>&1; then
+    adduser -D -s "$shell" "$user" >>"$LOG_FILE" 2>&1 && user_created=1
+  fi
+
+  [ "$user_created" -eq 1 ] || { err "$(msg ERR_USER_CREATE_FAIL)"; return 1; }
+  id "$user" >/dev/null 2>&1 || { err "$(msg ERR_USER_VERIFY_FAIL)"; return 1; }
+
+  safe_configure_sudo "$user" || true
+  return 0
+}
+
+# ---------------- Keys ----------------
 fetch_keys() {
-  local url=""
-  case "$1" in
-    gh)  url="https://github.com/$2.keys" ;;
-    url) url="$2" ;;
-    raw) printf "%s\n" "$2"; return ;;
+  mode="$1"
+  val="$2"
+  url=""
+
+  case "$mode" in
+    gh)  url="https://github.com/$val.keys" ;;
+    url) url="$val" ;;
+    raw) printf "%s\n" "$val"; return 0 ;;
+    *) return 1 ;;
   esac
 
-  local max_retries=3
-  local retry=0
+  if [ "$mode" = "url" ]; then
+    echo "$url" | grep -Eq '^https://|^http://' || { warn "Invalid URL scheme (must be http/https)"; return 1; }
+  fi
 
-  while [ $retry -lt $max_retries ]; do
+  retries=0
+  max_retries=3
+  while [ "$retries" -lt "$max_retries" ]; do
     if command -v curl >/dev/null 2>&1; then
       if curl -fsSL --connect-timeout 10 --max-time 30 "$url" 2>>"$LOG_FILE"; then
-         return 0
+        return 0
       fi
     elif command -v wget >/dev/null 2>&1; then
       if wget -qO- --timeout=30 "$url" 2>>"$LOG_FILE"; then
-         return 0
+        return 0
       fi
     else
       warn "Need curl or wget to fetch keys"
       return 1
     fi
-    retry=$((retry + 1))
-    [ $retry -lt $max_retries ] && sleep 2
+    retries=$((retries+1))
+    [ "$retries" -lt "$max_retries" ] && sleep 2
   done
-  
+
   warn "Failed to fetch keys after $max_retries attempts"
   return 1
+}
+
+# [FIX] Simplified: only return clean line or empty (caller handles warning)
+validate_ssh_key_line() {
+  line="$1"
+
+  line=$(printf '%s' "$line" | tr -d '\000-\037\177' | sed 's/[[:space:]]*#.*$//')
+  [ -z "$line" ] && return 1
+
+  if ! printf '%s' "$line" | grep -Eq '^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp[0-9]+|sk-(ssh-ed25519|ecdsa-sha2-nistp[0-9]+)@openssh\.com|ssh-(rsa|dss|ed25519)-cert-v01@openssh\.com|ecdsa-sha2-nistp[0-9]+-cert-v01@openssh\.com|rsa-sha2-(256|512))[[:space:]]+[A-Za-z0-9+/]+=*([[:space:]]+.*)?$'; then
+    return 1
+  fi
+
+  key_part=$(printf '%s' "$line" | awk '{print $2}')
+  [ -n "$key_part" ] || return 1
+
+  if command -v base64 >/dev/null 2>&1; then
+    if ! printf '%s' "$key_part" | base64 -d >/dev/null 2>&1; then
+      return 1
+    fi
+    key_type=$(printf '%s' "$line" | awk '{print $1}')
+    key_bytes=$(printf '%s' "$key_part" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+    case "$key_type" in
+      ssh-rsa|rsa-sha2-256|rsa-sha2-512)
+        [ -n "$key_bytes" ] && [ "$key_bytes" -ge 256 ] 2>/dev/null || return 1 ;;
+      ssh-ed25519|sk-ssh-ed25519@openssh.com)
+        [ -n "$key_bytes" ] && [ "$key_bytes" -ge 32 ] 2>/dev/null || return 1 ;;
+      ssh-dss)
+        [ -n "$key_bytes" ] && [ "$key_bytes" -ge 40 ] 2>/dev/null || return 1 ;;
+    esac
+  fi
+
+  printf "%s\n" "$line"
+  return 0
 }
 
 deploy_keys() {
   user="$1"
   keys="$2"
-  home="$(eval echo "~$user")"
+  home=$(get_user_home "$user")
   dir="$home/.ssh"
   auth="$dir/authorized_keys"
 
-  mkdir -p "$dir"
-  chmod 700 "$dir"
-  touch "$auth"
-  chmod 600 "$auth"
-  chown -R "$user:" "$dir" 2>/dev/null || true
+  mkdir -p "$dir" 2>/dev/null || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  touch "$auth" 2>/dev/null || return 1
+  chmod 600 "$auth" 2>/dev/null || true
 
+  if ! chown -R "${user}:${user}" "$dir" 2>/dev/null; then
+    chown -R "$user" "$dir" 2>/dev/null || true
+  fi
+
+  deployed_count=0
+  skipped_count=0
   printf "%s\n" "$keys" | while IFS= read -r line; do
     [ -z "$line" ] && continue
-    echo "$line" | grep -Eq '^(ssh-(rsa|ed25519|dss)|ecdsa-|sk-)' || continue
-    grep -qxF "$line" "$auth" || echo "$line" >>"$auth"
+    clean_line=$(validate_ssh_key_line "$line")
+    if [ -n "$clean_line" ]; then
+      grep -qxF "$clean_line" "$auth" 2>/dev/null || printf "%s\n" "$clean_line" >>"$auth"
+    fi
   done
-  grep -Eq '^(ssh-|ecdsa-|sk-)' "$auth"
+
+  [ -s "$auth" ]
 }
 
-# ---------------- Config Management ----------------
+# ---------------- sshd_config management ----------------
 cleanup_sshd_config_d() {
   if [ -d "$SSH_CONF_D" ]; then
     for conf in "$SSH_CONF_D"/*.conf; do
       [ -f "$conf" ] || continue
-      if grep -Eq '^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication)' "$conf"; then
-        mv "$conf" "${conf}.bak_server_init"
+      if grep -Eq '^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|ChallengeResponseAuthentication|KexAlgorithms|Ciphers|MACs|AddressFamily|ListenAddress)[[:space:]]' "$conf"; then
+        mv "$conf" "${conf}.bak_server_init" 2>/dev/null || true
         warn "$(msg CLEAN_D) $conf"
       fi
     done
@@ -799,166 +1220,376 @@ cleanup_sshd_config_d() {
 }
 
 remove_managed_block() {
-  tmp="$TMP_DIR/sshd_config.tmp"
-  cp -p "$SSH_CONF" "$tmp"
-  
+  tmp_in="$TMP_DIR/sshd_config.in"
+  tmp_out="$TMP_DIR/sshd_config.out"
+  cp -p "$SSH_CONF" "$tmp_in" 2>/dev/null || true
   awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
     $0==b {skip=1; next}
     $0==e {skip=0; next}
     skip!=1 {print}
-  ' "$SSH_CONF" >"$tmp"
-  
-  cat "$tmp" > "$SSH_CONF"
-  rm -f "$tmp"
+  ' "$tmp_in" >"$tmp_out"
+  if [ -s "$tmp_out" ]; then
+    cat "$tmp_out" > "$SSH_CONF"
+  fi
 }
 
-# v4.0.0: Robust Triple-Check IPv6
+sanitize_sshd_config() {
+  info "$(msg INFO_SANITIZE_DUP)"
+  tmp_san="$TMP_DIR/sshd_config.sanitized"
+
+  awk '
+    /^[[:space:]]*Port[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*PermitRootLogin[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*PasswordAuthentication[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*PubkeyAuthentication[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*ChallengeResponseAuthentication[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*KexAlgorithms[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*Ciphers[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*MACs[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*AddressFamily[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    /^[[:space:]]*ListenAddress[[:space:]]/ { print "# [server-init disabled] " $0; next }
+    { print }
+  ' "$SSH_CONF" > "$tmp_san"
+
+  if [ -s "$tmp_san" ]; then
+    cat "$tmp_san" > "$SSH_CONF"
+  fi
+}
+
 has_global_ipv6() {
-    # Method 1: Proc file (Common Linux)
-    if [ -f /proc/net/if_inet6 ]; then
-        if grep -v '^fe80::' /proc/net/if_inet6 2>/dev/null | grep -q '^[0-9a-f]'; then
-            return 0
-        fi
+  if [ -f /proc/net/if_inet6 ]; then
+    grep -v '^fe80' /proc/net/if_inet6 2>/dev/null | grep -q '^[0-9a-f]' && return 0
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip -6 addr show scope global 2>/dev/null | grep -q inet6 && return 0
+  fi
+  if command -v ifconfig >/dev/null 2>&1; then
+    ifconfig 2>/dev/null | grep -i 'inet6.*global' >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# ----- Crypto selection -----
+csv_contains() {
+  csv="$1"
+  item="$2"
+  echo ",$csv," | grep -q ",$item," 2>/dev/null
+}
+
+# [FIX] Proper IFS restoration handling unset case
+csv_intersect_ordered() {
+  pref="$1"
+  supp="$2"
+  result=""
+  
+  # Use subshell to isolate IFS change
+  result=$(
+    IFS=,
+    for a in $pref; do
+      if [ -n "$a" ] && csv_contains "$supp" "$a"; then
+        printf "%s\n" "$a"
+      fi
+    done
+  )
+  
+  # Convert newlines to commas
+  echo "$result" | tr '\n' ',' | sed 's/,$//'
+}
+
+# [FIX] Only use -C flag on OpenSSH >= 6.8
+get_sshd_T_value() {
+  key="$1"
+  v=""
+  
+  # Only try -C on OpenSSH 6.8+
+  if openssh_version_ge 6 8; then
+    v=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 -f "$SSH_CONF" 2>/dev/null | awk -v k="$key" 'tolower($1)==k {print $2; exit}')
+  fi
+  
+  # Fallback without -C
+  if [ -z "$v" ]; then
+    v=$(sshd -T -f "$SSH_CONF" 2>/dev/null | awk -v k="$key" 'tolower($1)==k {print $2; exit}')
+  fi
+  
+  echo "$v"
+}
+
+compute_crypto_lines() {
+  KEX_LINE=""
+  CIPHERS_LINE=""
+  MACS_LINE=""
+  CRYPTO_MODE="skip"
+
+  if ! command -v sshd >/dev/null 2>&1; then
+    CRYPTO_MODE="skip"
+    return 0
+  fi
+
+  supp_kex=$(get_sshd_T_value "kexalgorithms")
+  supp_ciphers=$(get_sshd_T_value "ciphers")
+  supp_macs=$(get_sshd_T_value "macs")
+
+  pref_kex="curve25519-sha256@libssh.org,curve25519-sha256,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512"
+  pref_ciphers="chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+  pref_macs="hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,umac-128@openssh.com"
+
+  if [ -n "$supp_kex" ] || [ -n "$supp_ciphers" ] || [ -n "$supp_macs" ]; then
+    sel_kex=$(csv_intersect_ordered "$pref_kex" "$supp_kex")
+    sel_ciphers=$(csv_intersect_ordered "$pref_ciphers" "$supp_ciphers")
+    sel_macs=$(csv_intersect_ordered "$pref_macs" "$supp_macs")
+
+    [ -n "$sel_kex" ] && KEX_LINE="KexAlgorithms $sel_kex"
+    [ -n "$sel_ciphers" ] && CIPHERS_LINE="Ciphers $sel_ciphers"
+    [ -n "$sel_macs" ] && MACS_LINE="MACs $sel_macs"
+
+    if [ -n "$KEX_LINE" ] || [ -n "$CIPHERS_LINE" ] || [ -n "$MACS_LINE" ]; then
+      CRYPTO_MODE="filtered"
+    else
+      CRYPTO_MODE="skip"
     fi
-    
-    # Method 2: ip command
-    if command -v ip >/dev/null 2>&1; then
-        if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
-            return 0
-        fi
-    fi
-    
-    # Method 3: ifconfig (Legacy/BSD-like)
-    if command -v ifconfig >/dev/null 2>&1; then
-        if ifconfig 2>/dev/null | grep -i 'inet6.*global' >/dev/null; then
-            return 0
-        fi
-    fi
-    return 1
+    return 0
+  fi
+
+  if openssh_version_ge 6 5; then
+    KEX_LINE="KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
+    CIPHERS_LINE="Ciphers chacha20-poly1305@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+    MACS_LINE="MACs hmac-sha2-512,hmac-sha2-256"
+    CRYPTO_MODE="fallback"
+  else
+    CRYPTO_MODE="skip"
+  fi
 }
 
 build_block() {
   file="$1"
   {
     echo "$BLOCK_BEGIN"
-    echo "# Managed by server-init v4.0.0"
+    echo "# Managed by server-init v4.5.1"
     echo "# Generated: $(date)"
+    echo "# OpenSSH: ${OPENSSH_VER_MAJOR}.${OPENSSH_VER_MINOR}"
     echo "# Do NOT edit inside this block. Changes will be overwritten."
     echo ""
-    echo "Port $SSH_PORT"
-    
-    echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
-    echo "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
-    echo "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
 
-    # Smart IPv6 Check
-    if has_global_ipv6; then
-       echo "AddressFamily any"
-       echo "ListenAddress ::"
-       echo "ListenAddress 0.0.0.0"
-       info "$(msg IPV6_CFG)"
+    echo "Port $SSH_PORT"
+
+    [ -n "$KEX_LINE" ] && echo "$KEX_LINE"
+    [ -n "$CIPHERS_LINE" ] && echo "$CIPHERS_LINE"
+    [ -n "$MACS_LINE" ] && echo "$MACS_LINE"
+
+    if [ "$IPV6_ENABLED" = "y" ]; then
+      echo "AddressFamily any"
+      echo "ListenAddress ::"
+      echo "ListenAddress 0.0.0.0"
     else
-       echo "AddressFamily inet"
-       echo "ListenAddress 0.0.0.0"
+      echo "AddressFamily inet"
+      echo "ListenAddress 0.0.0.0"
     fi
 
     if [ "$KEY_OK" = "y" ]; then
       echo "PasswordAuthentication no"
       echo "ChallengeResponseAuthentication no"
       echo "PubkeyAuthentication yes"
+    else
+      echo "PasswordAuthentication yes"
+      echo "PubkeyAuthentication yes"
     fi
 
     if [ "$TARGET_USER" = "root" ]; then
       if [ "$KEY_OK" = "y" ]; then
-        if sshd -V 2>&1 | grep -q "OpenSSH_[1-6]"; then
-           echo "PermitRootLogin without-password"
-           warn "$(msg COMPAT_WARN)"
+        if openssh_version_ge 7 0; then
+          echo "PermitRootLogin prohibit-password"
         else
-           echo "PermitRootLogin prohibit-password"
+          echo "PermitRootLogin without-password"
         fi
       else
         echo "PermitRootLogin yes"
       fi
     else
-      echo "PermitRootLogin no"
+      if [ "$KEY_OK" = "y" ]; then
+        echo "PermitRootLogin no"
+      else
+        if [ "$ROOT_KEY_PRESENT" = "y" ]; then
+          if openssh_version_ge 7 0; then
+            echo "PermitRootLogin prohibit-password"
+          else
+            echo "PermitRootLogin without-password"
+          fi
+        else
+          echo "PermitRootLogin yes"
+        fi
+      fi
     fi
 
     echo ""
     echo "$BLOCK_END"
-    echo ""
   } >"$file"
 }
 
-insert_block_at_top() {
+# [FIX] Use head/tail instead of awk catfile for better compatibility
+install_managed_block() {
   block="$1"
   tmp="$TMP_DIR/sshd_config.merge"
-  cat "$block" "$SSH_CONF" >"$tmp"
-  chmod 600 "$tmp"
+
+  # Find first non-comment Match line
+  match_line=$(awk '/^[[:space:]]*#/ {next} /^[[:space:]]*Match[[:space:]]/ {print NR; exit}' "$SSH_CONF" 2>/dev/null)
+
+  if [ -z "$match_line" ]; then
+    # No Match block found -> append at end
+    cat "$SSH_CONF" "$block" > "$tmp"
+  else
+    info "$(msg INFO_MATCH_INSERT)"
+    # Insert before Match block using head/tail
+    head -n $((match_line - 1)) "$SSH_CONF" > "$tmp"
+    cat "$block" >> "$tmp"
+    tail -n +$match_line "$SSH_CONF" >> "$tmp"
+  fi
+
+  chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$SSH_CONF"
+}
+
+verify_sshd_listening() {
+  port="$1"
+  timeout_s=10
+  elapsed=0
+
+  ensure_port_tools
+
+  while [ "$elapsed" -lt "$timeout_s" ]; do
+    if ! is_port_free "$port"; then
+      return 0
+    fi
+    if command -v nc >/dev/null 2>&1; then
+      nc -z -w 1 localhost "$port" 2>/dev/null && return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+enhanced_ssh_test() {
+  port="$1"
+  user="$2"
+  info "$(msg TEST_CONN)"
+
+  if ! verify_sshd_listening "$port"; then
+    err "SSHD not listening on port $port"
+    return 1
+  fi
+
+  if command -v nc >/dev/null 2>&1; then
+    proto=""
+    if command -v timeout >/dev/null 2>&1; then
+      proto=$(printf "SSH-2.0-TEST\r\n" | timeout 2 nc localhost "$port" 2>/dev/null || true)
+    else
+      proto=$(printf "SSH-2.0-TEST\r\n" | nc -w 2 localhost "$port" 2>/dev/null || true)
+    fi
+    echo "$proto" | grep -q "SSH-2.0" && ok "$(msg INFO_SSH_PROTOCOL_OK)" || warn "$(msg WARN_SSH_PROTOCOL)"
+  fi
+
+  attempts=1
+  max_attempts=3
+  success=0
+  while [ "$attempts" -le "$max_attempts" ]; do
+    if command -v ssh >/dev/null 2>&1; then
+      if ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
+           -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null \
+           -p "$port" "$user@localhost" "exit 0" >/dev/null 2>&1; then
+        success=1
+        break
+      fi
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -le "$max_attempts" ] && sleep 1
+  done
+
+  if [ "$success" -eq 1 ]; then
+    ok "$(msg TEST_OK)"
+    return 0
+  fi
+
+  if command -v nc >/dev/null 2>&1; then
+    if nc -z -w 2 localhost "$port" 2>/dev/null; then
+      warn "$(msg WARN_PORT_OPEN_BUT_FAIL)"
+      return 0
+    fi
+  fi
+
+  err "$(msg TEST_FAIL)"
+  return 1
 }
 
 update_motd() {
   info "$(msg MOTD_UPD)"
   motd="/etc/motd"
   tmp="$TMP_DIR/motd.new"
-  
-  if [ -f "$motd" ]; then
-      grep -v "Server Init Complete" "$motd" > "$tmp" 2>/dev/null || true
-  fi
-
+  [ -f "$motd" ] && grep -v "Server Init Complete" "$motd" > "$tmp" 2>/dev/null || true
   {
     echo "==============================================================================="
     echo "                      Server Init Complete - SSH Hardened"
     echo "==============================================================================="
     echo " Login User: $TARGET_USER"
     echo " SSH Port:   $SSH_PORT"
-    echo " Auth Type:  $([ "$KEY_OK" = "y" ] && echo "Key Only" || echo "Password")"
+    echo " Auth Type:  $([ "$KEY_OK" = "y" ] && echo "Key Only" || echo "Password/Fallback")"
     echo " Firewall:   Please ensure TCP/$SSH_PORT is allowed."
     echo "==============================================================================="
     echo ""
     [ -s "$tmp" ] && cat "$tmp"
   } > "${motd}.final"
-  
-  mv "${motd}.final" "$motd"
+  mv "${motd}.final" "$motd" 2>/dev/null || true
 }
 
-# v4.0.0: Final Health Report
 generate_health_report() {
-    report_file="/var/log/server-init-health.log"
-    # Calculate Duration
-    end_time=$(date +%s)
-    duration=$((end_time - SCRIPT_START_TIME))
-    
-    {
-      echo "=== Server Init Health Report ==="
-      echo "Generated: $(date)"
-      echo "Version: v4.0.0 Platinum"
-      echo "Execution Time: ${duration}s"
-      echo ""
-      echo "--- SSH Config ---"
-      echo "Port: $SSH_PORT"
-      echo "User: $TARGET_USER"
-      echo "KeyAuth: $([ "$KEY_OK" = "y" ] && echo "YES" || echo "NO")"
-      echo ""
-      echo "--- Network ---"
-      echo "Public IP: ${public_ip:-unknown}"
-      echo "IPv6: $(has_global_ipv6 && echo "Enabled" || echo "Disabled")"
-      echo "Port Listening: $(is_port_free "$SSH_PORT" && echo "NO (Error)" || echo "YES")"
-    } > "$report_file"
-    
-    chmod 600 "$report_file"
-    info "Health report saved to: $report_file"
+  report_file="/var/log/server-init-health.log"
+  end_time=$(date +%s)
+  duration=$((end_time - SCRIPT_START_TIME))
+  sys_uptime=$(uptime -p 2>/dev/null || uptime 2>/dev/null | awk -F, '{print $1}')
+
+  {
+    echo "=== Server Init Health Report ==="
+    echo "Generated: $(date)"
+    echo "Version: v4.5.1 Fortress Pro"
+    echo "Execution Time: ${duration}s"
+    echo ""
+    echo "--- System ---"
+    echo "Uptime: $sys_uptime"
+    echo "OpenSSH: ${OPENSSH_VER_MAJOR}.${OPENSSH_VER_MINOR}"
+    echo ""
+    echo "--- SSH Config ---"
+    echo "Port: $SSH_PORT"
+    echo "User: $TARGET_USER"
+    echo "KeyAuth: $([ "$KEY_OK" = "y" ] && echo "YES" || echo "NO")"
+    echo ""
+    echo "--- Network ---"
+    echo "IPv6: $([ "$IPV6_ENABLED" = "y" ] && echo "Enabled" || echo "Disabled")"
+    echo "Port Status: $(is_port_free "$SSH_PORT" && echo "NOT LISTENING (Error)" || echo "LISTENING (OK)")"
+    echo "Crypto Mode: $CRYPTO_MODE"
+  } > "$report_file" 2>/dev/null || true
+  chmod 600 "$report_file" 2>/dev/null || true
+  info "Health report saved to: $report_file"
 }
 
 print_final_summary() {
-  
-  # Try to detect public IP
   public_ip=""
   if command -v curl >/dev/null 2>&1; then
     public_ip=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || echo "")
   fi
-  local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
-  
+
+  local_ip=""
+  if command -v hostname >/dev/null 2>&1; then
+    local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  if [ -z "$local_ip" ] && command -v ip >/dev/null 2>&1; then
+    local_ip=$(ip -4 addr show 2>/dev/null | awk '
+      /inet / {
+        ip=$2
+        sub(/\/.*/, "", ip)
+        if (ip !~ /^127\./) { print ip; exit }
+      }
+    ')
+  fi
+
   end_time=$(date +%s)
   duration=$((end_time - SCRIPT_START_TIME))
 
@@ -967,169 +1598,162 @@ print_final_summary() {
   printf "${CYAN}║ %-66s ║${NC}\n" "$(msg BOX_TITLE)"
   echo "${CYAN}╠════════════════════════════════════════════════════════════════════╣${NC}"
   printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_SSH)"
-  
-  if [ -n "$public_ip" ]; then
-     printf "${CYAN}║     Public: ssh -p %-5s %s@%s %-16s ║${NC}\n" "$SSH_PORT" "$TARGET_USER" "$public_ip" ""
-  fi
-  if [ -n "$local_ip" ]; then
-     printf "${CYAN}║     Local:  ssh -p %-5s %s@%s %-16s ║${NC}\n" "$SSH_PORT" "$TARGET_USER" "$local_ip" ""
-  fi
-
+  [ -n "$public_ip" ] && printf "${CYAN}║     Public: ssh -p %-5s %s@%s %-16s ║${NC}\n" "$SSH_PORT" "$TARGET_USER" "$public_ip" ""
+  [ -n "$local_ip" ] && printf "${CYAN}║     Local:  ssh -p %-5s %s@%s %-16s ║${NC}\n" "$SSH_PORT" "$TARGET_USER" "$local_ip" ""
   echo "${CYAN}║                                                                    ║${NC}"
-  
+
   if [ "$KEY_OK" = "y" ]; then
     printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_KEY_ON)"
   else
     printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_KEY_OFF)"
   fi
-  
+
   if [ "$SSH_PORT" != "22" ]; then
     printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_PORT)$SSH_PORT"
     printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_FW)"
     if is_k8s_nodeport "$SSH_PORT"; then
-       printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_K8S_WARN)"
+      printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_K8S_WARN)"
     fi
   fi
-  
+
   echo "${CYAN}║                                                                    ║${NC}"
   printf "${CYAN}║ %-66s ║${NC}\n" " $(msg BOX_WARN)"
   echo "${CYAN}╚════════════════════════════════════════════════════════════════════╝${NC}"
   echo ""
   echo "Log: $LOG_FILE"
+  echo "Audit: $AUDIT_FILE"
   echo "Time: ${duration}s"
 }
 
+validate_ssh_config_comprehensive() {
+  config_file="$1"
+  user="$2"
+  key_ok="$3"
+
+  if ! sshd -t -f "$config_file" 2>>"$LOG_FILE"; then
+    err "SSH Config Syntax Error"
+    return 1
+  fi
+
+  password_auth=$(grep -E '^[[:space:]]*PasswordAuthentication[[:space:]]' "$config_file" 2>/dev/null | tail -1 | awk '{print $2}')
+  pubkey_auth=$(grep -E '^[[:space:]]*PubkeyAuthentication[[:space:]]' "$config_file" 2>/dev/null | tail -1 | awk '{print $2}')
+  port_setting=$(grep -E '^[[:space:]]*Port[[:space:]]' "$config_file" 2>/dev/null | tail -1 | awk '{print $2}')
+
+  [ -n "$password_auth" ] || password_auth="yes"
+  [ -n "$pubkey_auth" ] || pubkey_auth="yes"
+  [ -n "$port_setting" ] || port_setting="22"
+
+  if [ "$password_auth" = "no" ] && [ "$pubkey_auth" = "no" ]; then
+    die "$(msg ERR_DEADLOCK)"
+  fi
+  if [ "$password_auth" = "no" ] && [ "$key_ok" != "y" ]; then
+    die "$(msg ERR_PASSWORD_NO_KEY)"
+  fi
+  if [ "$user" = "root" ] && [ "$password_auth" = "no" ] && [ "$key_ok" != "y" ]; then
+    die "$(msg ERR_ROOT_NO_KEY)"
+  fi
+  if [ "$port_setting" != "$SSH_PORT" ]; then
+    warn "$(msg WARN_PORT_MISMATCH) ($port_setting vs $SSH_PORT)"
+  fi
+
+  insecure_options=0
+  if grep -q "^[[:space:]]*X11Forwarding[[:space:]]*yes" "$config_file" 2>/dev/null; then
+    warn "$(msg WARN_X11_FORWARDING)"
+    insecure_options=$((insecure_options + 1))
+  fi
+  if grep -q "^[[:space:]]*PermitEmptyPasswords[[:space:]]*yes" "$config_file" 2>/dev/null; then
+    warn "$(msg WARN_EMPTY_PASSWORDS)"
+    insecure_options=$((insecure_options + 1))
+  fi
+  [ "$insecure_options" -gt 0 ] && warn "$(msg WARN_INSECURE_OPTIONS) $insecure_options"
+
+  return 0
+}
+
 # =========================================================
-# Phase 1: Input
+# Entry
 # =========================================================
-clear
+[ "$(id -u)" -eq 0 ] || { echo "$(msg MUST_ROOT)"; exit 1; }
+audit_log "START" "Script started with args: $*"
+
+if command -v clear >/dev/null 2>&1; then clear; fi
 echo "================================================="
 msg BANNER
 echo "================================================="
 [ "$STRICT_MODE" = "y" ] && msg STRICT_ON
 
-# Preflight Checks
 preflight_checks
 
-# 1. User
+# Phase 1: Input
 if [ -n "$ARG_USER" ]; then
   TARGET_USER="$ARG_USER"
-  # Validating argument user
   validate_username "$TARGET_USER" || die "$(msg ERR_USER_INV): $TARGET_USER"
   printf "%s%s\n" "$(msg AUTO_SKIP)" "$TARGET_USER"
 else
   while :; do
-      printf "%s%s): " "$(msg ASK_USER)" "$DEFAULT_USER"
-      read TARGET_USER
-      [ -z "$TARGET_USER" ] && TARGET_USER="$DEFAULT_USER"
-      if validate_username "$TARGET_USER"; then
-         break
-      else
-         msg ERR_USER_INV
-      fi
+    printf "%s%s): " "$(msg ASK_USER)" "$DEFAULT_USER"
+    read -r TARGET_USER
+    [ -z "$TARGET_USER" ] && TARGET_USER="$DEFAULT_USER"
+    validate_username "$TARGET_USER" && break
+    msg ERR_USER_INV
   done
 fi
 
-# 2. Port
 if [ -n "$ARG_PORT" ]; then
   case "$ARG_PORT" in
-    22)     PORT_OPT="1"; SSH_PORT="22" ;;
-    random) PORT_OPT="2"; SSH_PORT="22" ;; 
-    *)      PORT_OPT="3"; SSH_PORT="$ARG_PORT" ;;
+    22) PORT_OPT="1"; SSH_PORT="22" ;;
+    random) PORT_OPT="2"; SSH_PORT="22" ;;
+    *) PORT_OPT="3"; SSH_PORT="$ARG_PORT" ;;
   esac
   printf "%s%s\n" "$(msg AUTO_SKIP)" "$ARG_PORT (Mode $PORT_OPT)"
 else
   echo ""
-  msg ASK_PORT_T
-  msg OPT_PORT_1
-  msg OPT_PORT_2
-  msg OPT_PORT_3
-  printf "%s" "$(msg SELECT)"
-  read PORT_OPT
+  msg ASK_PORT_T; msg OPT_PORT_1; msg OPT_PORT_2; msg OPT_PORT_3
+  printf "%s" "$(msg SELECT)"; read -r PORT_OPT
   [ -z "$PORT_OPT" ] && PORT_OPT="1"
-
   SSH_PORT="22"
   if [ "$PORT_OPT" = "3" ]; then
     while :; do
       printf "%s" "$(msg INPUT_PORT)"
-      read MANUAL_PORT
+      read -r MANUAL_PORT
       echo "$MANUAL_PORT" | grep -Eq '^[0-9]+$' || { msg PORT_ERR; continue; }
       [ "$MANUAL_PORT" -ge 1024 ] 2>/dev/null && [ "$MANUAL_PORT" -le 65535 ] 2>/dev/null || { msg PORT_ERR; continue; }
-      
       if is_hard_reserved "$MANUAL_PORT"; then
-         msg PORT_RES
-         continue
+        msg PORT_RES
+        continue
       elif is_k8s_nodeport "$MANUAL_PORT"; then
-         msg PORT_K8S
-         printf "%s" "$(msg ASK_SURE)"
-         read force_port
-         [ "${force_port:-n}" = "y" ] || continue
+        msg PORT_K8S
+        printf "%s" "$(msg ASK_SURE)"
+        read -r force_port
+        [ "${force_port:-n}" = "y" ] || continue
       fi
-      
       SSH_PORT="$MANUAL_PORT"
       break
     done
   fi
 fi
 
-# 3. Key
 if [ -n "$ARG_KEY_TYPE" ]; then
-  KEY_OPT="auto"
-  KEY_TYPE="$ARG_KEY_TYPE"
-  KEY_VAL="$ARG_KEY_VAL"
+  KEY_OPT="auto"; KEY_TYPE="$ARG_KEY_TYPE"; KEY_VAL="$ARG_KEY_VAL"
   printf "%s%s\n" "$(msg AUTO_SKIP)" "$KEY_TYPE ($KEY_VAL)"
 else
   echo ""
-  msg ASK_KEY_T
-  msg OPT_KEY_1
-  msg OPT_KEY_2
-  msg OPT_KEY_3
-  printf "%s" "$(msg SELECT)"
-  read KEY_OPT
-
+  msg ASK_KEY_T; msg OPT_KEY_1; msg OPT_KEY_2; msg OPT_KEY_3
+  printf "%s" "$(msg SELECT)"; read -r KEY_OPT
   case "$KEY_OPT" in
-    1) KEY_TYPE="gh";  printf "%s" "$(msg INPUT_GH)"; read KEY_VAL ;;
-    2) KEY_TYPE="url"; printf "%s" "$(msg INPUT_URL)"; read KEY_VAL ;;
-    3)
-        KEY_TYPE="raw"
-        msg INPUT_RAW
-        raw=""
-        while IFS= read -r l; do
-          [ -z "$l" ] && break
-          raw="${raw}${l}\n"
-        done
-        KEY_VAL="$(printf "%b" "$raw")"
-        ;;
+    1) KEY_TYPE="gh";  printf "%s" "$(msg INPUT_GH)"; read -r KEY_VAL ;;
+    2) KEY_TYPE="url"; printf "%s" "$(msg INPUT_URL)"; read -r KEY_VAL ;;
+    3) KEY_TYPE="raw"; msg INPUT_RAW; raw=""; while IFS= read -r l; do [ -z "$l" ] && break; raw="${raw}${l}\n"; done; KEY_VAL="$(printf "%b" "$raw")" ;;
     *) die "Invalid Option" ;;
   esac
 fi
 
-# 4. Update
-if [ -n "$ARG_UPDATE" ]; then
-  DO_UPDATE="$ARG_UPDATE"
-  printf "%s%s\n" "$(msg AUTO_SKIP)" "Update=$DO_UPDATE"
-else
-  printf "%s" "$(msg ASK_UPD)"
-  read DO_UPDATE
-  [ -z "$DO_UPDATE" ] && DO_UPDATE="n"
-fi
+if [ -n "$ARG_UPDATE" ]; then DO_UPDATE="$ARG_UPDATE"; printf "%s%s\n" "$(msg AUTO_SKIP)" "Update=$DO_UPDATE"; else printf "%s" "$(msg ASK_UPD)"; read -r DO_UPDATE; [ -z "$DO_UPDATE" ] && DO_UPDATE="n"; fi
+if [ -n "$ARG_BBR" ]; then DO_BBR="$ARG_BBR"; printf "%s%s\n" "$(msg AUTO_SKIP)" "BBR=$DO_BBR"; else printf "%s" "$(msg ASK_BBR)"; read -r DO_BBR; [ -z "$DO_BBR" ] && DO_BBR="n"; fi
 
-# 5. BBR
-if [ -n "$ARG_BBR" ]; then
-  DO_BBR="$ARG_BBR"
-  printf "%s%s\n" "$(msg AUTO_SKIP)" "BBR=$DO_BBR"
-else
-  printf "%s" "$(msg ASK_BBR)"
-  read DO_BBR
-  [ -z "$DO_BBR" ] && DO_BBR="n"
-fi
-
-# =========================================================
 # Phase 2: Confirm
-# =========================================================
 if [ "$AUTO_CONFIRM" = "y" ]; then
-  echo ""
-  info "Auto-Confirm: Skipping interactive confirmation."
+  echo ""; info "Auto-Confirm: Skipping interactive confirmation."
 else
   echo ""
   msg CONFIRM_T
@@ -1139,38 +1763,30 @@ else
   echo "$(msg C_UPD)$DO_UPDATE"
   echo "$(msg C_BBR)$DO_BBR"
   [ "$PORT_OPT" != "1" ] && msg WARN_FW
-
   printf "%s" "$(msg ASK_SURE)"
-  read CONFIRM
+  read -r CONFIRM
   [ "${CONFIRM:-n}" = "y" ] || die "$(msg CANCEL)"
 fi
 
-# =========================================================
-# Phase 3: Execute (With Enhanced Rollback)
-# =========================================================
+# Phase 3: Execute
 msg AUDIT_START
 setup_rollback
-backup_config_persistent
+backup_config_persistent || true
 
 info "$(msg I_INSTALL)"
 ensure_ssh_server
-install_pkg_try curl >/dev/null 2>&1 || true # Soft check, fetch_keys handles fail
+
+detect_openssh_version
+info "OpenSSH Version: ${OPENSSH_VER_MAJOR}.${OPENSSH_VER_MINOR}"
+
+install_pkg_try curl >/dev/null 2>&1 || true
 install_pkg_try wget >/dev/null 2>&1 || true
 
-# Updates & BBR
-if [ "$DO_UPDATE" = "y" ]; then
-  info "$(msg I_UPD)"
-  update_system
-fi
+if [ "$DO_UPDATE" = "y" ]; then info "$(msg I_UPD)"; update_system; fi
+if [ "$DO_BBR" = "y" ]; then info "$(msg I_BBR)"; enable_bbr; fi
 
-if [ "$DO_BBR" = "y" ]; then
-  info "$(msg I_BBR)"
-  enable_bbr
-fi
-
-# Random Port Calculation
 if [ "$PORT_OPT" = "2" ]; then
-  p="$(pick_random_port || true)"
+  p="$(pick_random_port 2>/dev/null || true)"
   if [ -n "$p" ]; then
     SSH_PORT="$p"
     info "Random Port: $SSH_PORT"
@@ -1181,18 +1797,18 @@ if [ "$PORT_OPT" = "2" ]; then
   fi
 fi
 
-# Firewall & SELinux
 if [ "$SSH_PORT" != "22" ]; then
   allow_firewall_port "$SSH_PORT"
   handle_selinux "$SSH_PORT"
 fi
 
-# User ensure
-ensure_user "$TARGET_USER"
+safe_ensure_user "$TARGET_USER" || die "User setup failed"
 
-# Key Deploy
+root_home=$(get_user_home root)
+[ -s "$root_home/.ssh/authorized_keys" ] && ROOT_KEY_PRESENT="y" || ROOT_KEY_PRESENT="n"
+
 KEY_OK="n"
-KEY_DATA="$(fetch_keys "$KEY_TYPE" "$KEY_VAL")"
+KEY_DATA="$(fetch_keys "$KEY_TYPE" "$KEY_VAL" 2>/dev/null || true)"
 if [ -n "$KEY_DATA" ] && deploy_keys "$TARGET_USER" "$KEY_DATA"; then
   KEY_OK="y"
   info "$(msg I_KEY_OK)"
@@ -1201,54 +1817,49 @@ else
   warn "$(msg W_KEY_FAIL)"
 fi
 
-# SSH Config Manipulation
+if has_global_ipv6; then
+  IPV6_ENABLED="y"
+  info "$(msg IPV6_CFG)"
+else
+  IPV6_ENABLED="n"
+fi
+
+compute_crypto_lines
+if [ "$CRYPTO_MODE" = "skip" ]; then
+  info "$(msg INFO_OLD_SSH_SKIP_ALGO)"
+elif [ "$CRYPTO_MODE" = "fallback" ]; then
+  warn "$(msg COMPAT_WARN)"
+fi
+
 info "$(msg I_BACKUP)$SSH_CONF"
 cleanup_sshd_config_d
 remove_managed_block
+sanitize_sshd_config
 
 tmp="$TMP_DIR/sshd_block_final"
 build_block "$tmp"
-insert_block_at_top "$tmp"
 
-# Optimized: Apply Systemd protection once
-if [ "$ARG_DELAY_RESTART" != "y" ]; then
-   protect_sshd_service
-fi
+install_managed_block "$tmp"
 
-# Validation 1: Syntax
-if ! sshd -t -f "$SSH_CONF" 2>>"$LOG_FILE"; then
-  die "$(msg E_SSHD_CHK)"
-fi
+if [ "$ARG_DELAY_RESTART" != "y" ]; then protect_sshd_service; fi
 
-# Restart
-if ! restart_sshd; then
-  warn "$(msg W_RESTART)"
-fi
+if ! sshd -t -f "$SSH_CONF" 2>>"$LOG_FILE"; then die "$(msg E_SSHD_CHK)"; fi
+validate_ssh_config_comprehensive "$SSH_CONF" "$TARGET_USER" "$KEY_OK"
 
-# Validation 2: Verification (Grep)
-if ! grep -q "^Port $SSH_PORT" "$SSH_CONF"; then
-    die "$(msg E_GREP_FAIL)"
-fi
+restart_sshd || warn "$(msg W_RESTART)"
 
-# Validation 3: Active Listening (Network)
-if ! verify_sshd_listening "$SSH_PORT"; then
-    die "$(msg W_LISTEN_FAIL)"
-fi
+grep -Eq "^[[:space:]]*Port[[:space:]]+$SSH_PORT([[:space:]]|\$)" "$SSH_CONF" 2>/dev/null || die "$(msg E_GREP_FAIL)"
+verify_sshd_listening "$SSH_PORT" || die "$(msg W_LISTEN_FAIL)"
+enhanced_ssh_test "$SSH_PORT" "$TARGET_USER" || die "$(msg TEST_FAIL)"
 
-# Self-Test Connection (Check BEFORE removing trap)
-if ! test_ssh_connection "$SSH_PORT" "$TARGET_USER"; then
-  die "$(msg TEST_FAIL)"
-fi
-
-# MotD Update
 update_motd
 generate_health_report
 
-# Only remove trap if EVERYTHING passed
 trap - INT TERM EXIT HUP
-rm -rf "$TMP_DIR"
+cleanup_state
+cleanup_locks
+rm -rf "$TMP_DIR" 2>/dev/null || true
 
-# =========================================================
-# Done
-# =========================================================
 print_final_summary
+audit_log "DONE" "Completed successfully. user=$TARGET_USER port=$SSH_PORT key_ok=$KEY_OK"
+exit 0

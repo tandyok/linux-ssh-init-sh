@@ -21,16 +21,16 @@ It safely handles **SSH key deployment**, **port changing**, **user creation**, 
 
 ### ✨ Key Features
 
-* **Universal Compatibility**: Works flawlessly on **Debian 10/11/12**, **Ubuntu**, **CentOS 7/8/9**, **Alma/Rocky**, and **Alpine Linux**.
+* **Universal Compatibility**: Works flawlessly on **Debian**, **Ubuntu**, **CentOS/RHEL**, **Alma/Rocky**, and **Alpine Linux**.
 * **POSIX Compliant**: Written in pure `/bin/sh`. No `bash` dependency. Runs perfectly on `dash` (Debian) and `ash` (Alpine/Busybox).
-* **Safety Architecture**:
+* **Security Architecture (Fortress Pro)**:
     * **Managed Config Block**: Inserts configuration at the **top** of `sshd_config` to strictly override vendor defaults (bypasses the Debian 12 `Include` trap).
-    * **Atomic Verification**: Validates config with `sshd -t` before restarting. Automatically rolls back on failure to prevent downtime.
-    * **Anti-Lockout**: If SSH keys fail to deploy, it **will not** disable password login, ensuring you don't lose access.
-    * **Firewall Awareness**: Automatically detects and configures `ufw` or `firewalld` if port is changed.
+    * **Auto-Rollback**: If SSHD validation fails, port is not listening, or connection test fails during execution, the script **automatically reverts** all system changes.
+    * **Service Protection (Anti-Kill)**: Adds a systemd `override.conf` to prevent OOM kills and ensures SSHD restarts automatically on failure.
+    * **Deadlock Prevention**: Intelligently detects authentication states to prevent "Password Disabled + No Key" lockouts.
 * **Automation Friendly**:
-    * Supports **Headless Mode**, allowing zero-interaction unattended installation via command line arguments.
-    * **Random High Port**: Automatically generates a random port between 20000-60000 and checks for availability.
+    * Supports **Headless Mode** allowing zero-interaction unattended installation.
+    * **Audit & Reporting**: Automatically generates detailed operation audit logs and system health reports.
 
 ### 🚀 Quick Start
 
@@ -79,9 +79,10 @@ The script supports rich command-line arguments to control its behavior:
 | **Control** | `--lang=en` | Force English UI |
 | | `--yes` | **Auto Confirm**: Skip the final "Proceed?" prompt |
 | | `--strict` | **Strict Mode**: Exit immediately on error (see below) |
+| | `--delay-restart` | **Delay Restart**: Apply config but do not restart SSHD immediately |
 | **User/Port** | `--user=root` | Specify login user (root or username) |
 | | `--port=22` | Keep default port 22 |
-| | `--port=random` | Generate random high port (20000-60000) |
+| | `--port=random` | Generate random high port (49152-65535) |
 | | `--port=2222` | Specify a specific port number |
 | **Keys** | `--key-gh=username` | Fetch public key from GitHub |
 | | `--key-url=url` | Download public key from URL |
@@ -98,18 +99,50 @@ The script supports rich command-line arguments to control its behavior:
 | **Philosophy** | **"Don't Lockout"** (Best Effort) | **"Compliance First"** (Zero Tolerance) |
 | **Key Failure** | If key download fails, script **keeps Password Auth enabled** and warns you.<br>👉 *Result: Server reachable but less secure.* | Script **exits immediately**. No changes applied.<br>👉 *Result: Deployment aborted, state unchanged.* |
 | **Port Failure** | If random port fails, it falls back to **Port 22**. | Script **exits immediately**. |
-| **Use Case** | Manual setup, unstable networks. | CI/CD pipelines, high-security requirements. |
 
-### 🛠️ Execution Details
+### 📂 Logs & Audit
 
-1.  **Dependency Check**: Auto-detects package manager (`apt`, `yum`, `apk`) and installs dependencies (`curl`, `sudo`, `openssh-server`).
-2.  **User Setup**: Creates the specified user (if not root) and grants password-less `sudo` privileges.
-3.  **Key Deployment**: Deploys SSH public keys, fixes `.ssh` permissions, and supports deduplication.
-4.  **SSH Hardening**:
-    * Backs up `sshd_config`.
-    * Cleans up old script blocks.
-    * Inserts a new configuration block at the **top** of the file (Disable password, Change port, etc.) to ensure highest priority.
-5.  **Finalization**: Validates config syntax, restarts SSH service, and applies BBR/Updates if selected.
+After execution, the following files are generated for troubleshooting and auditing:
+
+* **Run Log**: `/var/log/server-init.log` (Detailed debug information)
+* **Audit Log**: `/var/log/server-init-audit.log` (Records key actions, timestamps, and operators)
+* **Health Report**: `/var/log/server-init-health.log` (Snapshot of the final system configuration state)
+
+### 🆘 Disaster Recovery & Restore
+
+The script features a dual-layer safety mechanism: **Runtime Auto-Rollback** and **Persistent Backup Restore**.
+
+If you cannot connect to your server via SSH after the script finishes (after seeing "DONE"), log in via your Cloud Provider's **VNC / Console** and use one of the following methods.
+
+#### Method A: One-Click Restore Script (Recommended)
+
+The script automatically creates a backup and generates a restore script before applying changes.
+
+1.  Find the latest backup directory:
+    ```bash
+    ls -ld /var/backups/ssh-config/*
+    ```
+2.  Enter the directory and run the restore script:
+    ```bash
+    # Enter the latest timestamp directory (e.g., 20250520_120000)
+    cd /var/backups/ssh-config/<TIMESTAMP>/
+    
+    # Run the restore script
+    sh restore.sh
+    ```
+    *This will automatically overwrite `sshd_config` and attempt to restart the SSH service.*
+
+#### Method B: Manual Restore
+
+If the restore script is unavailable, manually copy the files:
+
+```bash
+# 1. Overwrite configuration
+cp /var/backups/ssh-config/<TIMESTAMP>/sshd_config /etc/ssh/sshd_config
+
+# 2. Restart Service
+systemctl restart sshd || service sshd restart
+```
 
 ---
 

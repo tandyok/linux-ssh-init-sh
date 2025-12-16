@@ -21,65 +21,77 @@ jobs:
           - 'quay.io/centos/centos:stream9'
 
     steps:
-      # 关键点 2: 在宿主机上检出代码 (Ubuntu 支持 Node20，没问题)
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 关键点 3: 使用 docker run 手动启动容器并挂载代码
       - name: Run Test in Container
         run: |
-          # 打印当前测试的镜像
           echo "🚀 Testing on image: ${{ matrix.container }}"
-          
-          # 赋予脚本执行权限
           chmod +x init.sh
 
-          # 启动 Docker 容器运行测试逻辑
-          # --rm: 跑完删除
-          # --privileged: 允许修改系统参数
-          # -v $(pwd):/mnt: 把当前宿主机的代码挂载到容器的 /mnt 目录
+          # 启动容器并运行所有逻辑
           docker run --rm --privileged -v $(pwd):/mnt -w /mnt ${{ matrix.container }} /bin/sh -c '
             
-            # === 第一步：修复 CentOS 7 EOL 源 (起死回生) ===
+            # ============================================
+            # 1. 针对 CentOS 7 的“强效起死回生”补丁
+            # ============================================
             if [ -f /etc/redhat-release ] && grep -q "CentOS Linux 7" /etc/redhat-release; then
-              echo "Fixing CentOS 7 EOL repos..."
-              sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/CentOS-Base.repo
-              sed -i "s|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-Base.repo
+              echo "💀 Detected CentOS 7 (EOL). Fixing repositories to Vault..."
+              
+              # 1. 注释掉失效的 mirrorlist
+              sed -i "s/^mirrorlist/#mirrorlist/g" /etc/yum.repos.d/CentOS-*.repo
+              
+              # 2. 启用 baseurl 并指向 vault.centos.org (处理带#和不带#的情况)
+              sed -i "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-*.repo
+              sed -i "s|^baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-*.repo
+              
+              # 3. 清理缓存，防止残留
+              yum clean all
+              rm -rf /var/cache/yum
             fi
 
-            # === 第二步：环境补全 (安装 sudo, curl, sshd, 生成 key) ===
-            echo "Installing dependencies..."
+            # ============================================
+            # 2. 环境补全 (安装 sudo, sshd, 生成 key)
+            # ============================================
+            echo "📦 Installing dependencies..."
             
-            # Debian / Ubuntu
+            # --- Debian / Ubuntu ---
             if [ -f /etc/debian_version ]; then
               apt-get update -y && apt-get install -y curl sudo openssh-server
               ssh-keygen -A
               mkdir -p /run/sshd
             fi
 
-            # Alpine
+            # --- Alpine ---
             if [ -f /etc/alpine-release ]; then
               apk add --no-cache curl sudo openssh-server bash
               ssh-keygen -A
             fi
 
-            # RHEL / CentOS / Alma / Rocky
+            # --- RHEL / CentOS / Alma / Rocky ---
             if [ -f /etc/redhat-release ]; then
               # AlmaLinux 9 解决 curl-minimal 冲突
               if command -v dnf >/dev/null; then
                 dnf install -y --allowerasing curl sudo openssh-server
               else
+                # 对于 CentOS 7，这一步现在应该能成功了
                 yum install -y curl sudo openssh-server
               fi
+              
+              # 生成主机密钥 (关键修复)
               ssh-keygen -A
               mkdir -p /run/sshd
             fi
 
-            # === 第三步：运行你的脚本 ===
-            echo "Running init script..."
+            # ============================================
+            # 3. 运行你的脚本
+            # ============================================
+            echo "🚀 Running init script..."
             ./init.sh --user=root --port=2222 --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5" --no-update --bbr --delay-restart --yes --strict
             
-            # === 第四步：验证结果 ===
+            # ============================================
+            # 4. 验证结果
+            # ============================================
             if grep -q "BEGIN SERVER-INIT MANAGED BLOCK" /etc/ssh/sshd_config; then
                echo "✅ SUCCESS: Config block injected."
             else

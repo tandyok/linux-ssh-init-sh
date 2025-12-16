@@ -273,7 +273,7 @@ msg() {
       WARN_PORT_OPEN_BUT_FAIL) echo "⚠️ 端口已打开，但SSH客户端连接失败" ;;
       WARN_X11_FORWARDING) echo "⚠️ X11转发已启用，可能存在安全风险" ;;
       WARN_EMPTY_PASSWORDS) echo "⚠️ 允许空密码，存在安全风险" ;;
-      WARN_INSECURE_OPTIONS) echo "⚠️ 发现潜在的不安全选项" ;;
+      WARN_INSECURE_OPTIONS) echo "⚠️ 检测到非关键的不安全选项 (仅提示，不影响安装)" ;;
       ERR_DEADLOCK) echo "❌ 致命错误：密码和密钥认证同时被禁用，将导致锁定！" ;;
       ERR_PASSWORD_NO_KEY) echo "❌ 致命错误：密码认证已禁用但未成功部署SSH密钥" ;;
       ERR_ROOT_NO_KEY) echo "❌ 致命错误：root密码登录已禁用但未部署SSH密钥" ;;
@@ -411,7 +411,7 @@ msg() {
       WARN_PORT_OPEN_BUT_FAIL) echo "⚠️ Port is open but SSH client connection failed" ;;
       WARN_X11_FORWARDING) echo "⚠️ X11 forwarding enabled, potential security risk" ;;
       WARN_EMPTY_PASSWORDS) echo "⚠️ Empty passwords allowed, security risk" ;;
-      WARN_INSECURE_OPTIONS) echo "⚠️ Found potential insecure options" ;;
+      WARN_INSECURE_OPTIONS) echo "⚠️ Found non-critical insecure options (Info only, proceeding)" ;;
       ERR_DEADLOCK) echo "❌ FATAL: Both password and key authentication disabled, will cause lockout!" ;;
       ERR_PASSWORD_NO_KEY) echo "❌ FATAL: Password auth disabled but no SSH key deployed" ;;
       ERR_ROOT_NO_KEY) echo "❌ FATAL: Root password login disabled but no SSH key deployed" ;;
@@ -1048,7 +1048,12 @@ validate_port() {
 
 # ---------------- User & Sudo ----------------
 validate_username() {
-  u="$1"
+  raw="$1"
+  # [UX-FIX] 自动去除首尾空格，并将大写转小写(可选，这里主要去空格)
+  u=$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  
+  # 必须将清洗后的变量回写给全局变量，否则后续 useradd 还是会用带空格的
+  TARGET_USER="$u"
   
   [ "$u" = "root" ] && return 0
   
@@ -1628,7 +1633,7 @@ install_managed_block() {
 
 verify_sshd_listening() {
   port="$1"
-  timeout_s=10
+  timeout_s=30  # [FIX] 延长至 30 秒，适应 Vultr 等慢速机器
   elapsed=0
 
   ensure_port_tools

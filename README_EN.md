@@ -1,20 +1,12 @@
 # Linux Server Init & SSH Hardening Script
 
-<p align="center">
-  <strong>
-    <a href="README.md">🇨🇳 中文文档</a> | 🇺🇸 English
-  </strong>
-</p>
+[![Test Matrix](https://github.com/247like/linux-ssh-init-sh/actions/workflows/test.yml/badge.svg)](https://github.com/247like/linux-ssh-init-sh/actions/workflows/test.yml)
+![POSIX Shell](https://img.shields.io/badge/Shell-POSIX_sh-blue?style=flat-square)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/247like/linux-ssh-init-sh?style=flat-square)](https://github.com/247like/linux-ssh-init-sh/releases)
+[![Stars](https://img.shields.io/github/stars/247like/linux-ssh-init-sh?style=flat-square)](https://github.com/247like/linux-ssh-init-sh/stargazers)
 
-<p align="center">
-  <a href="https://github.com/247like/linux-ssh-init-sh/actions/workflows/test.yml">
-    <img src="https://github.com/247like/linux-ssh-init-sh/actions/workflows/test.yml/badge.svg" alt="Test Matrix">
-  </a>
-  <img src="https://img.shields.io/badge/Shell-POSIX_sh-blue?style=flat-square" alt="POSIX Shell">
-  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/github/v/release/247like/linux-ssh-init-sh?style=flat-square" alt="Release">
-  <img src="https://img.shields.io/github/stars/247like/linux-ssh-init-sh?style=flat-square" alt="Stars">
-</p>
+[![中文文档](https://img.shields.io/badge/中文-Chinese-blue)](README.md) [![English](https://img.shields.io/badge/English-EN-blue)](README_EN.md)
 
 ---
 

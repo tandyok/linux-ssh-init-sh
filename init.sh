@@ -1215,6 +1215,10 @@ safe_ensure_user() {
   [ "$user_created" -eq 1 ] || { err "$(msg ERR_USER_CREATE_FAIL)"; return 1; }
   id "$user" >/dev/null 2>&1 || { err "$(msg ERR_USER_VERIFY_FAIL)"; return 1; }
 
+  # [FIX] 解锁用户账户，防止因 shadow 密码锁定导致 sudo NOPASSWD 失效
+  # 使用 passwd -d 清除密码（变为无密码状态），配合 SSH Key 使用是安全的，且能让 PAM 通过账户检查
+  passwd -d "$user" >/dev/null 2>&1 || usermod -U "$user" >/dev/null 2>&1 || true
+
   safe_configure_sudo "$user" || true
   return 0
 }
@@ -1583,6 +1587,7 @@ build_block() {
 
     if [ "$KEY_OK" = "y" ]; then
       echo "PasswordAuthentication no"
+      echo "PermitEmptyPasswords no"
       echo "ChallengeResponseAuthentication no"
       echo "PubkeyAuthentication yes"
       # [SEC-FIX] Add KbdInteractiveAuthentication no for true key-only auth

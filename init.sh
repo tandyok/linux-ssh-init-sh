@@ -1771,40 +1771,36 @@ update_motd() {
   motd="/etc/motd"
   if [ -f "$motd" ]; then
     cp -p "$motd" "${motd}.bak" 2>/dev/null
-    # 清理旧的 Server Init 信息
+    # 清理旧的 Server Init 遗留信息
     grep -vE "Server Init|Login User:|SSH Port:|Auth Type:|Firewall:|={10,}" "$motd" > "${motd}.clean" 2>/dev/null
     cat "${motd}.clean" > "$motd"
     rm -f "${motd}.clean" "${motd}.bak" 2>/dev/null
   fi
 
   # ---------------------------------------------------------
-  # 2. 创建动态脚本 (使用 printf 确保 POSIX 兼容)
+  # 2. 创建动态脚本 (生成到 /etc/profile.d/)
   # ---------------------------------------------------------
-  # 确保目录存在 (Alpine 极简版可能默认没有这个目录)
   mkdir -p /etc/profile.d
 
-  # 使用 'EOF' (带单引号) 防止在生成文件时变量被立即解析
-  # 这样变量会在用户登录时才解析，确保动态性
+  # 使用 'EOF' 防止变量在写入文件时被提前解析
   cat > "/etc/profile.d/z99-ssh-init-banner.sh" <<'EOF'
 #!/bin/sh
 # 动态获取当前真实的 SSH 配置
 SSH_CONF="/etc/ssh/sshd_config"
 REAL_PORT="22"
+AUTH_TYPE="Unknown"
 REAL_USER=$(whoami 2>/dev/null || echo "unknown")
 
-# 读取端口 (获取最后出现的 Port 指令，处理可能的空格)
+# 如果有读取权限（通常是 root），则尝试动态刷新显示最新配置
 if [ -r "$SSH_CONF" ]; then
     CONF_PORT=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2}' "$SSH_CONF" | tail -n 1)
     [ -n "$CONF_PORT" ] && REAL_PORT="$CONF_PORT"
     
-    # 检测认证方式
     if grep -Ei '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$SSH_CONF" >/dev/null 2>&1; then
         AUTH_TYPE="Password/Key"
     else
         AUTH_TYPE="Key Only (Secure)"
     fi
-else
-    AUTH_TYPE="Unknown"
 fi
 
 # 颜色定义 (ANSI)
@@ -1813,10 +1809,10 @@ C_CYAN="\033[0;36m"
 C_GREEN="\033[1;32m"
 C_YELLOW="\033[1;33m"
 
-# 使用 printf 而非 echo -e 以确保 Debian/Alpine/CentOS 通用兼容
+# 打印横幅
 printf "\n"
 printf "${C_CYAN}===============================================================================${C_RESET}\n"
-printf "${C_CYAN}                      Server Init Managed - SSH Hardened${C_RESET}\n"
+printf "${C_CYAN}                       Server Init Managed - SSH Hardened${C_RESET}\n"
 printf "${C_CYAN}===============================================================================${C_RESET}\n"
 printf " Login User: ${C_GREEN}%s${C_RESET}\n" "$REAL_USER"
 printf " SSH Port:   ${C_GREEN}%s${C_RESET} (Dynamic Check)\n" "$REAL_PORT"
@@ -1826,6 +1822,17 @@ printf "${C_CYAN}===============================================================
 printf "\n"
 EOF
 
+  # ---------------------------------------------------------
+  # 3. [修复核心] 注入当前脚本已知的正确变量 (解决权限导致的显示问题)
+  # ---------------------------------------------------------
+  # 根据当前脚本执行状态确定认证类型
+  [ "$KEY_OK" = "y" ] && FINAL_AUTH="Key Only (Secure)" || FINAL_AUTH="Password/Key"
+  
+  # 使用 | 作为 sed 定界符，防止 FINAL_AUTH 中的 / 引起语法错误
+  # 将 REAL_PORT 和 AUTH_TYPE 的默认值直接修改为本次脚本执行的真实值
+  sed -i "s|REAL_PORT=\"22\"|REAL_PORT=\"$SSH_PORT\"|" "/etc/profile.d/z99-ssh-init-banner.sh"
+  sed -i "s|AUTH_TYPE=\"Unknown\"|AUTH_TYPE=\"$FINAL_AUTH\"|" "/etc/profile.d/z99-ssh-init-banner.sh"
+  
   chmod 644 "/etc/profile.d/z99-ssh-init-banner.sh"
 }
 
